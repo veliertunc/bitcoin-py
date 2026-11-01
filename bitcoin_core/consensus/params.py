@@ -15,6 +15,7 @@ class ConsensusParams:
     subsidy_halving_interval: int = 210_000
     allow_min_difficulty: bool = False
     no_retargeting: bool = False
+    enforce_bip94: bool = False
 
     def __post_init__(self) -> None:
         if not 0 < self.pow_limit < 1 << 256:
@@ -33,5 +34,5 @@ _MAINNET_POW_LIMIT = int("00000000ffffffffffffffffffffffffffffffffffffffffffffff
 _REGTEST_POW_LIMIT = int("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 
 MAINNET = ConsensusParams(pow_limit=_MAINNET_POW_LIMIT)
-TESTNET = ConsensusParams(pow_limit=_MAINNET_POW_LIMIT, allow_min_difficulty=True)
+TESTNET = ConsensusParams(pow_limit=_MAINNET_POW_LIMIT, allow_min_difficulty=True, enforce_bip94=True)
 REGTEST = ConsensusParams(pow_limit=_REGTEST_POW_LIMIT, no_retargeting=True)
