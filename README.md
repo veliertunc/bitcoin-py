@@ -1,13 +1,11 @@
-Bitcoin Core integration/staging tree
-=====================================
+# Bitcoin Core integration/staging tree
 
 https://bitcoincore.org
 
 For an immediately usable, binary version of the Bitcoin Core software, see
 https://bitcoincore.org/en/download/.
 
-What is Bitcoin Core?
----------------------
+## What is Bitcoin Core?
 
 Bitcoin Core connects to the Bitcoin peer-to-peer network to download and fully
 validate blocks and transactions. It also includes a wallet and graphical user
@@ -15,14 +13,7 @@ interface, which can be optionally built.
 
 Further information about Bitcoin Core is available in the [doc folder](/doc).
 
-License
--------
-
-Bitcoin Core is released under the terms of the MIT license. See [COPYING](COPYING) for more
-information or see https://opensource.org/license/MIT.
-
-Development Process
--------------------
+## Development Process
 
 The `master` branch is regularly built (see `doc/build-*.md` for instructions) and tested, but it is not guaranteed to be
 completely stable. [Tags](https://github.com/bitcoin/bitcoin/tags) are created
@@ -36,8 +27,7 @@ that repository unless it is for development reasons.
 The contribution workflow is described in [CONTRIBUTING.md](CONTRIBUTING.md)
 and useful hints for developers can be found in [doc/developer-notes.md](doc/developer-notes.md).
 
-Testing
--------
+## Testing
 
 Testing and code review is the bottleneck for development; we get more pull
 requests than we can review and test on short notice. Please be patient and help out by testing
@@ -66,8 +56,7 @@ code. This is especially important for large or high-risk changes. It is useful
 to add a test plan to the pull request description if testing the changes is
 not straightforward.
 
-Translations
-------------
+## Translations
 
 Changes to translations as well as new translations can be submitted to
 [Bitcoin Core's Transifex page](https://explore.transifex.com/bitcoin/bitcoin/).
