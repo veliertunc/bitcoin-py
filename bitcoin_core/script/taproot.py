@@ -8,6 +8,7 @@ from bitcoin_core.crypto.hashes import sha256
 from bitcoin_core.crypto.schnorr import tagged_hash, verify_schnorr
 from bitcoin_core.crypto.secp256k1 import GENERATOR, ORDER, _point_add, _point_mul
 from bitcoin_core.primitives.transaction import Transaction, TxOutput
+from bitcoin_core.script.interpreter import ScriptError, ScriptFlags, cast_to_bool, eval_tapscript
 from bitcoin_core.serialization.compact_size import write_compact_size
 
 SIGHASH_DEFAULT = 0
@@ -144,7 +145,12 @@ class TaprootSignatureChecker:
     key_version: int = 0
     code_separator_position: int = 0xFFFFFFFF
 
-    def __call__(self, signature: bytes, public_key: bytes) -> bool:
+    def __call__(
+        self,
+        signature: bytes,
+        public_key: bytes,
+        code_separator_position: int | None = None,
+    ) -> bool:
         if len(signature) == 64:
             hash_type = SIGHASH_DEFAULT
             schnorr_signature = signature
@@ -163,7 +169,11 @@ class TaprootSignatureChecker:
                 ext_flag=self.ext_flag,
                 tapleaf=self.tapleaf,
                 key_version=self.key_version,
-                code_separator_position=self.code_separator_position,
+                code_separator_position=(
+                    self.code_separator_position
+                    if code_separator_position is None
+                    else code_separator_position
+                ),
             )
         except ValueError:
             return False
@@ -190,3 +200,57 @@ def verify_taproot_keypath(
         return False
     checker = TaprootSignatureChecker(tx, input_index, tuple(spent_outputs), annex=annex)
     return checker(witness_items[0], script_pubkey[2:])
+
+
+def verify_taproot_scriptpath(
+    tx: Transaction,
+    input_index: int,
+    spent_outputs: tuple[SpentOutput, ...] | list[SpentOutput],
+    witness: tuple[bytes, ...] | list[bytes],
+    *,
+    flags: ScriptFlags = ScriptFlags.NONE,
+) -> bool:
+    """Validate a Taproot script-path witness and execute its tapscript leaf."""
+    if not 0 <= input_index < len(tx.inputs) or len(spent_outputs) != len(tx.inputs):
+        return False
+    witness_items = list(witness)
+    original_witness = witness_items.copy()
+    annex = None
+    if len(witness_items) >= 2 and witness_items[-1].startswith(b"\x50"):
+        annex = witness_items.pop()
+    if len(witness_items) < 2:
+        return False
+    script, control_block = witness_items[-2:]
+    stack = witness_items[:-2]
+    try:
+        script_pubkey = spent_outputs[input_index].script_pubkey
+        leaf_hash = verify_taproot_commitment(script_pubkey, script, control_block)
+        leaf_version = control_block[0] & 0xFE
+        if leaf_version != 0xC0:
+            if flags & ScriptFlags.DISCOURAGE_UPGRADABLE_TAPROOT_VERSION:
+                raise ScriptError("discouraged future Taproot leaf version")
+            return True
+        serialized_witness_size = len(write_compact_size(len(original_witness)))
+        serialized_witness_size += sum(
+            len(write_compact_size(len(item))) + len(item) for item in original_witness
+        )
+        checker = TaprootSignatureChecker(
+            tx,
+            input_index,
+            tuple(spent_outputs),
+            annex=annex,
+            ext_flag=1,
+            tapleaf=leaf_hash,
+        )
+        result = eval_tapscript(
+            script,
+            stack,
+            checker=checker,
+            sigop_budget=50 + serialized_witness_size,
+            flags=flags,
+        )
+        if len(result) != 1 or not cast_to_bool(result[0]):
+            raise ScriptError("tapscript evaluated to false or left an unclean stack")
+        return True
+    except (ScriptError, ValueError, EOFError):
+        return False

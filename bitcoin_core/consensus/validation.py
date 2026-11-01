@@ -22,7 +22,10 @@ def check_block(block: Block, params: ConsensusParams, *, check_pow: bool = True
     """Check context-free block structure, Merkle commitment, and proof of work."""
     if not block.transactions:
         return BlockCheckResult(False, "block has no transactions")
-    if not block.transactions[0].inputs or not block.transactions[0].inputs[0].previous_output.is_null:
+    if (
+        len(block.transactions[0].inputs) != 1
+        or not block.transactions[0].inputs[0].previous_output.is_null
+    ):
         return BlockCheckResult(False, "first transaction is not coinbase")
     if any(txin.previous_output.is_null for tx in block.transactions[1:] for txin in tx.inputs):
         return BlockCheckResult(False, "non-coinbase transaction contains a null prevout")

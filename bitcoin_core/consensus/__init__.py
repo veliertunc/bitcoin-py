@@ -9,9 +9,14 @@ from .pow import (
     encode_compact_target,
 )
 from .subsidy import block_subsidy
+from .chainstate import BlockConnectionError, BlockUndo, Coin, CoinsView, connect_block, disconnect_block
 
 __all__ = [
     "ConsensusParams",
+    "BlockConnectionError",
+    "BlockUndo",
+    "Coin",
+    "CoinsView",
     "MAINNET",
     "REGTEST",
     "TESTNET",
@@ -19,6 +24,8 @@ __all__ = [
     "block_subsidy",
     "calculate_next_work_required",
     "check_proof_of_work",
+    "connect_block",
     "decode_compact_target",
+    "disconnect_block",
     "encode_compact_target",
 ]

@@ -7,10 +7,12 @@ callback; this keeps script execution independent from transaction assembly.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from enum import IntFlag
 from typing import Callable, Iterable
 
 from bitcoin_core.crypto.hashes import hash160, hash256, sha256
+from bitcoin_core.primitives.transaction import Transaction
 from bitcoin_core.script import opcodes as op
 
 MAX_SCRIPT_SIZE = 10_000
@@ -20,10 +22,23 @@ MAX_OPS_PER_SCRIPT = 201
 MAX_PUBKEYS_PER_MULTISIG = 20
 
 SignatureChecker = Callable[[bytes, bytes, bytes], bool]
+TaprootChecker = Callable[[bytes, bytes, int], bool]
 
 
 class ScriptError(ValueError):
     """Raised when script parsing or execution fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptTransactionContext:
+    """Transaction fields used by CLTV and CSV script opcodes."""
+
+    transaction: Transaction
+    input_index: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.input_index < len(self.transaction.inputs):
+            raise ValueError("script input index out of range")
 
 
 class ScriptFlags(IntFlag):
@@ -33,6 +48,14 @@ class ScriptFlags(IntFlag):
     NULL_DUMMY = 4
     CLEAN_STACK = 8
     DISCOURAGE_UPGRADABLE_NOPS = 16
+    DISCOURAGE_OP_SUCCESS = 32
+    DISCOURAGE_UPGRADABLE_PUBKEYTYPE = 64
+    DISCOURAGE_UPGRADABLE_TAPROOT_VERSION = 128
+    CHECKLOCKTIMEVERIFY = 256
+    CHECKSEQUENCEVERIFY = 512
+    DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM = 1024
+    STRICTENC = 2048
+    LOW_S = 4096
 
 
 def cast_to_bool(value: bytes) -> bool:
@@ -150,9 +173,13 @@ def eval_script(
     *,
     flags: ScriptFlags = ScriptFlags.NONE,
     checker: SignatureChecker | None = None,
+    tapscript: bool = False,
+    taproot_checker: TaprootChecker | None = None,
+    sigop_budget: list[int] | None = None,
+    tx_context: ScriptTransactionContext | None = None,
 ) -> list[bytes]:
     """Execute one script and return its resulting main stack."""
-    if len(script) > MAX_SCRIPT_SIZE:
+    if not tapscript and len(script) > MAX_SCRIPT_SIZE:
         raise ScriptError("script exceeds maximum size")
     main = list(stack)
     alt: list[bytes] = []
@@ -162,6 +189,8 @@ def eval_script(
     op_count = 0
     offset = 0
     last_code_separator = 0
+    last_code_separator_position = 0xFFFFFFFF
+    opcode_position = 0
     disabled = {
         op.OP_VERIF, op.OP_VERNOTIF, op.OP_CAT, op.OP_SUBSTR, op.OP_LEFT, op.OP_RIGHT,
         op.OP_INVERT, op.OP_AND, op.OP_OR, op.OP_XOR, op.OP_2MUL, op.OP_2DIV,
@@ -171,13 +200,15 @@ def eval_script(
     while offset < len(script):
         instruction_start = offset
         opcode, pushed, offset = _read_op(script, offset)
+        instruction_position = opcode_position
+        opcode_position += 1
         if pushed is not None and len(pushed) > MAX_SCRIPT_ELEMENT_SIZE:
             raise ScriptError("pushed element exceeds 520 bytes")
         if opcode > op.OP_16:
             op_count += 1
-            if op_count > MAX_OPS_PER_SCRIPT:
+            if not tapscript and op_count > MAX_OPS_PER_SCRIPT:
                 raise ScriptError("operation count exceeds limit")
-        if opcode in disabled:
+        if opcode in disabled and not tapscript:
             raise ScriptError("disabled opcode")
 
         executing = all(conditions)
@@ -194,7 +225,7 @@ def eval_script(
             if executing:
                 _require(main, 1)
                 raw = main.pop()
-                if flags & ScriptFlags.MINIMAL_DATA and raw not in (b"", b"\x01"):
+                if (flags & ScriptFlags.MINIMAL_DATA or tapscript) and raw not in (b"", b"\x01"):
                     raise ScriptError("non-minimal IF argument")
                 value = cast_to_bool(raw)
                 if opcode == op.OP_NOTIF:
@@ -213,19 +244,60 @@ def eval_script(
             continue
         if not executing:
             continue
-        if opcode in (op.OP_RESERVED, op.OP_VER, op.OP_INVALIDOPCODE, op.OP_CHECKSIGADD):
+        if opcode in (op.OP_RESERVED, op.OP_VER, op.OP_INVALIDOPCODE) or (
+            opcode == op.OP_CHECKSIGADD and not tapscript
+        ):
             raise ScriptError("reserved or unsupported opcode")
         if opcode == op.OP_1NEGATE:
             main.append(encode_script_num(-1))
         elif op.OP_1 <= opcode <= op.OP_16:
             main.append(encode_script_num(opcode - op.OP_1 + 1))
-        elif opcode in (op.OP_NOP, *range(op.OP_NOP1, op.OP_NOP10 + 1)):
-            if flags & ScriptFlags.DISCOURAGE_UPGRADABLE_NOPS and opcode != op.OP_NOP:
-                raise ScriptError("discouraged upgradeable NOP")
-        elif opcode == op.OP_CHECKLOCKTIMEVERIFY or opcode == op.OP_CHECKSEQUENCEVERIFY:
+        elif opcode in (op.OP_NOP, op.OP_NOP1, *range(op.OP_NOP4, op.OP_NOP10 + 1)):
             if flags & ScriptFlags.DISCOURAGE_UPGRADABLE_NOPS:
-                raise ScriptError("timelock opcode needs transaction context")
-            # Without the corresponding consensus flag Core treats these as NOPs.
+                raise ScriptError("discouraged upgradeable NOP")
+        elif opcode == op.OP_CHECKLOCKTIMEVERIFY:
+            if not flags & ScriptFlags.CHECKLOCKTIMEVERIFY:
+                if flags & ScriptFlags.DISCOURAGE_UPGRADABLE_NOPS:
+                    raise ScriptError("discouraged CHECKLOCKTIMEVERIFY NOP")
+            else:
+                if tx_context is None:
+                    raise ScriptError("CHECKLOCKTIMEVERIFY needs transaction context")
+                _require(main, 1)
+                lock_time = decode_script_num(
+                    main[-1], max_size=5, minimal=bool(flags & ScriptFlags.MINIMAL_DATA)
+                )
+                tx = tx_context.transaction
+                txin = tx.inputs[tx_context.input_index]
+                if lock_time < 0:
+                    raise ScriptError("negative CHECKLOCKTIMEVERIFY argument")
+                if (lock_time < 500_000_000) != (tx.lock_time < 500_000_000):
+                    raise ScriptError("CHECKLOCKTIMEVERIFY lock-time type mismatch")
+                if lock_time > tx.lock_time or txin.sequence == 0xFFFFFFFF:
+                    raise ScriptError("CHECKLOCKTIMEVERIFY check failed")
+        elif opcode == op.OP_CHECKSEQUENCEVERIFY:
+            if not flags & ScriptFlags.CHECKSEQUENCEVERIFY:
+                if flags & ScriptFlags.DISCOURAGE_UPGRADABLE_NOPS:
+                    raise ScriptError("discouraged CHECKSEQUENCEVERIFY NOP")
+            else:
+                if tx_context is None:
+                    raise ScriptError("CHECKSEQUENCEVERIFY needs transaction context")
+                _require(main, 1)
+                sequence = decode_script_num(
+                    main[-1], max_size=5, minimal=bool(flags & ScriptFlags.MINIMAL_DATA)
+                )
+                if sequence < 0:
+                    raise ScriptError("negative CHECKSEQUENCEVERIFY argument")
+                if not sequence & (1 << 31):
+                    tx = tx_context.transaction
+                    tx_sequence = tx.inputs[tx_context.input_index].sequence
+                    type_flag = 1 << 22
+                    sequence_mask = 0x0000FFFF
+                    if tx.version < 2 or tx_sequence & (1 << 31):
+                        raise ScriptError("CHECKSEQUENCEVERIFY disabled by transaction")
+                    if (sequence & type_flag) != (tx_sequence & type_flag):
+                        raise ScriptError("CHECKSEQUENCEVERIFY type mismatch")
+                    if (sequence & sequence_mask) > (tx_sequence & sequence_mask):
+                        raise ScriptError("CHECKSEQUENCEVERIFY check failed")
         elif opcode == op.OP_VERIFY:
             _require(main, 1)
             if not cast_to_bool(main.pop()):
@@ -365,17 +437,67 @@ def eval_script(
             main.append(digest)
         elif opcode == op.OP_CODESEPARATOR:
             last_code_separator = offset
+            last_code_separator_position = instruction_position
         elif opcode in (op.OP_CHECKSIG, op.OP_CHECKSIGVERIFY):
             _require(main, 2)
             pubkey = main.pop()
             signature = main.pop()
             code = script[last_code_separator:]
-            success = bool(checker and checker(signature, pubkey, code)) if signature else False
+            if tapscript:
+                if opcode in (op.OP_CHECKMULTISIG, op.OP_CHECKMULTISIGVERIFY):
+                    raise ScriptError("CHECKMULTISIG is disabled in tapscript")
+                if not pubkey:
+                    raise ScriptError("empty public key in tapscript")
+                if not signature:
+                    success = False
+                else:
+                    if sigop_budget is not None:
+                        sigop_budget[0] -= 50
+                        if sigop_budget[0] < 0:
+                            raise ScriptError("tapscript signature operation budget exceeded")
+                    if len(pubkey) == 32:
+                        success = bool(taproot_checker and taproot_checker(
+                            signature, pubkey, last_code_separator_position
+                        ))
+                        if not success:
+                            raise ScriptError("invalid tapscript signature")
+                    elif flags & ScriptFlags.DISCOURAGE_UPGRADABLE_PUBKEYTYPE:
+                        raise ScriptError("discouraged future public-key type")
+                    else:
+                        success = True
+            else:
+                success = bool(checker and checker(signature, pubkey, code)) if signature else False
             if opcode == op.OP_CHECKSIGVERIFY:
                 if not success:
                     raise ScriptError("CHECKSIGVERIFY failed")
             else:
                 main.append(encode_script_num(int(success)))
+        elif opcode in (op.OP_CHECKMULTISIG, op.OP_CHECKMULTISIGVERIFY) and tapscript:
+            raise ScriptError("CHECKMULTISIG is disabled in tapscript")
+        elif tapscript and opcode == op.OP_CHECKSIGADD:
+            _require(main, 3)
+            pubkey = main.pop()
+            number = decode_script_num(main.pop(), minimal=bool(flags & ScriptFlags.MINIMAL_DATA), max_size=4)
+            signature = main.pop()
+            if not pubkey:
+                raise ScriptError("empty public key in tapscript")
+            success = False
+            if signature:
+                if sigop_budget is not None:
+                    sigop_budget[0] -= 50
+                    if sigop_budget[0] < 0:
+                        raise ScriptError("tapscript signature operation budget exceeded")
+                if len(pubkey) == 32:
+                    success = bool(taproot_checker and taproot_checker(
+                        signature, pubkey, last_code_separator_position
+                    ))
+                    if not success:
+                        raise ScriptError("invalid tapscript signature")
+                elif flags & ScriptFlags.DISCOURAGE_UPGRADABLE_PUBKEYTYPE:
+                    raise ScriptError("discouraged future public-key type")
+                else:
+                    success = True
+            main.append(encode_script_num(number + int(success)))
         elif opcode in (op.OP_CHECKMULTISIG, op.OP_CHECKMULTISIGVERIFY):
             key_count = _pop_num(main, flags)
             if not 0 <= key_count <= MAX_PUBKEYS_PER_MULTISIG:
@@ -421,12 +543,49 @@ def eval_script(
     return main
 
 
+_OP_SUCCESS = {
+    0x50, 0x62, *range(0x7E, 0x82), *range(0x83, 0x87), 0x89, 0x8A,
+    0x8D, 0x8E, *range(0x95, 0x9A), *range(0xBB, 0xFF),
+}
+
+
+def eval_tapscript(
+    script: bytes,
+    stack: Iterable[bytes] = (),
+    *,
+    checker: TaprootChecker | None = None,
+    sigop_budget: int = 50,
+    flags: ScriptFlags = ScriptFlags.NONE,
+) -> list[bytes]:
+    """Execute tapscript, applying OP_SUCCESS and signature-budget rules."""
+    initial_stack = list(stack)
+    if len(initial_stack) > MAX_STACK_SIZE or any(len(item) > MAX_SCRIPT_ELEMENT_SIZE for item in initial_stack):
+        raise ScriptError("initial tapscript stack exceeds limits")
+    offset = 0
+    while offset < len(script):
+        opcode, pushed, offset = _read_op(script, offset)
+        if pushed is None and opcode in _OP_SUCCESS:
+            if flags & ScriptFlags.DISCOURAGE_OP_SUCCESS:
+                raise ScriptError("discouraged OP_SUCCESS opcode")
+            return [b"\x01"]
+    budget = [sigop_budget]
+    return eval_script(
+        script,
+        initial_stack,
+        flags=flags,
+        tapscript=True,
+        taproot_checker=checker,
+        sigop_budget=budget,
+    )
+
+
 def verify_script(
     script_sig: bytes,
     script_pubkey: bytes,
     *,
     checker: SignatureChecker | None = None,
     flags: ScriptFlags = ScriptFlags.NONE,
+    tx_context: ScriptTransactionContext | None = None,
 ) -> bool:
     """Evaluate scriptSig then scriptPubKey and apply final stack rules."""
     is_p2sh = (
@@ -437,16 +596,16 @@ def verify_script(
     )
     if flags & ScriptFlags.P2SH and is_p2sh and not is_push_only(script_sig):
         raise ScriptError("scriptSig is not push-only")
-    stack = eval_script(script_sig, checker=checker, flags=flags)
+    stack = eval_script(script_sig, checker=checker, flags=flags, tx_context=tx_context)
     saved_stack = stack.copy()
-    stack = eval_script(script_pubkey, stack, checker=checker, flags=flags)
+    stack = eval_script(script_pubkey, stack, checker=checker, flags=flags, tx_context=tx_context)
     if not stack or not cast_to_bool(stack[-1]):
         raise ScriptError("script evaluated to false")
     if flags & ScriptFlags.P2SH and is_p2sh:
         if not saved_stack:
             raise ScriptError("P2SH scriptSig does not provide a redeem script")
         redeem_script = saved_stack.pop()
-        stack = eval_script(redeem_script, saved_stack, checker=checker, flags=flags)
+        stack = eval_script(redeem_script, saved_stack, checker=checker, flags=flags, tx_context=tx_context)
         if not stack or not cast_to_bool(stack[-1]):
             raise ScriptError("redeem script evaluated to false")
     if flags & ScriptFlags.CLEAN_STACK and len(stack) != 1:
