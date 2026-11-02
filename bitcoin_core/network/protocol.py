@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from bitcoin_core.crypto.hashes import hash256
 
@@ -23,6 +23,7 @@ class InvalidMessage(ValueError):
 class Message:
     command: str
     payload: bytes
+    wire_size: int = field(default=0, compare=False)
 
 
 def _validate_magic(magic: bytes) -> None:
@@ -81,7 +82,7 @@ def decode_message(raw: bytes, magic: bytes = MAINNET_MAGIC, *, max_payload: int
     payload = raw[HEADER_SIZE:]
     if hash256(payload)[:4] != raw[20:24]:
         raise InvalidMessage("P2P payload checksum mismatch")
-    return Message(command, payload)
+    return Message(command, payload, len(raw))
 
 
 class MessageParser:

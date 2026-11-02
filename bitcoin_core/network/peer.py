@@ -36,6 +36,8 @@ class PeerHandshake:
     received_verack: bool = False
     sent_wtxidrelay: bool = False
     received_wtxidrelay: bool = False
+    sent_addrv2: bool = False
+    received_addrv2: bool = False
 
     def start(self, version: VersionMessage) -> bytes:
         """Construct the initial version message and transition to VERSION_SENT."""
@@ -75,6 +77,10 @@ class PeerHandshake:
             ):
                 raise PeerProtocolError("unexpected or malformed wtxidrelay message")
             self.received_wtxidrelay = True
+        elif message.command == "sendaddrv2":
+            if self.remote_version is None or self.received_verack or message.payload:
+                raise PeerProtocolError("unexpected or malformed sendaddrv2 message")
+            self.received_addrv2 = True
         elif message.command == "verack":
             if self.remote_version is None or self.received_verack or message.payload:
                 raise PeerProtocolError("unexpected or malformed verack message")

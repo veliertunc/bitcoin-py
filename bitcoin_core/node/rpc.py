@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import hashlib
 import hmac
+import ipaddress
 import json
+import math
 import os
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,8 +22,14 @@ from bitcoin_core.consensus.chainstate import CoinsView
 from bitcoin_core.consensus.params import ConsensusParams
 from bitcoin_core.consensus.pow import decode_compact_target
 from bitcoin_core.consensus.subsidy import block_subsidy
+from bitcoin_core.consensus.versionbits import NEVER_ACTIVE, ThresholdState, VersionBits
 from bitcoin_core.network.connection import PeerConnection
-from bitcoin_core.node.chain import HeaderChain
+from bitcoin_core.network.addrman import AddressBook
+from bitcoin_core.network.banman import BanManager, parse_subnet
+from bitcoin_core.network.version import NODE_COMPACT_FILTERS, NODE_NETWORK
+from bitcoin_core.node.chain import HeaderChain, expected_work_bits
+from bitcoin_core.node.block_policy_estimator import BlockPolicyEstimator
+from bitcoin_core.node.fee_estimator import MempoolFeeEstimator
 from bitcoin_core.node.mempool import Mempool, MempoolEntry, MempoolError
 from bitcoin_core.node.mempool_persistence import MempoolLoadResult
 from bitcoin_core.node.mining import create_block_template
@@ -27,6 +38,7 @@ from bitcoin_core.node.storage import SQLiteNodeStore
 from bitcoin_core.node.utxo_stats import calculate_utxo_stats
 from bitcoin_core.primitives.block import Block, BlockHeader
 from bitcoin_core.primitives.transaction import Transaction
+from bitcoin_core.script.describe import script_pubkey_json, script_to_asm
 from bitcoin_core.serialization.compact_size import write_compact_size
 
 MAX_RPC_BODY = 16 * 1024 * 1024
@@ -67,6 +79,19 @@ class NodeRPC:
     proposal_check: Callable[[Block], str | None] | None = None
     save_mempool: Callable[[], str] | None = None
     import_mempool: Callable[[str, dict[str, bool]], MempoolLoadResult] | None = None
+    network_totals: Callable[[], tuple[int, int]] = field(default=lambda: (0, 0))
+    address_book: AddressBook | None = None
+    network_active: Callable[[], bool] = field(default=lambda: True)
+    set_network_active: Callable[[bool], bool] | None = None
+    disconnect_peer: Callable[[str | None, int | None], Awaitable[bool]] | None = None
+    manage_added_node: Callable[[str, str], Awaitable[None]] | None = None
+    added_node_info: Callable[[str | None], list[dict[str, Any]]] | None = None
+    ban_manager: BanManager | None = None
+    disconnect_banned: Callable[[Any], Awaitable[None]] | None = None
+    peer_inflight_blocks: Callable[[PeerConnection], list[int]] = field(default=lambda _peer: [])
+    fee_estimator: MempoolFeeEstimator | None = None
+    block_policy_estimator: BlockPolicyEstimator | None = None
+    _versionbits: dict[str, VersionBits] = field(default_factory=dict, init=False)
 
     async def call(self, method: str, params: list[Any] | dict[str, Any] | None = None) -> Any:
         params = [] if params is None else params
@@ -74,8 +99,17 @@ class NodeRPC:
             return self.store.best_height()
         if method == "getdifficulty":
             return self._active_difficulty()
+        if method == "getnetworkhashps":
+            return self._network_hash_ps(
+                self._param(params, 0, "nblocks", 120),
+                self._param(params, 1, "height", -1),
+            )
+        if method == "getmininginfo":
+            return self._mining_info()
         if method == "getchaintips":
             return self._chain_tips()
+        if method == "getdeploymentinfo":
+            return self._deployment_info(self._param(params, 0, "blockhash"))
         if method == "getchaintxstats":
             return self._chain_tx_stats(
                 self._param(params, 0, "nblocks"),
@@ -162,6 +196,12 @@ class NodeRPC:
                 self._param(params, 1, "n"),
                 bool(self._param(params, 2, "include_mempool", True)),
             )
+        if method == "testmempoolaccept":
+            return self._test_mempool_accept(
+                self._param(params, 0, "rawtxs"),
+                self._param(params, 1, "maxfeerate", 0.1),
+                self._param(params, 2, "maxburnamount", 0.0),
+            )
         if method == "getrawtransaction":
             return self._get_raw_transaction(
                 self._param(params, 0, "txid"),
@@ -196,6 +236,17 @@ class NodeRPC:
                 "permitbaremultisig": self.mempool.permit_bare_multisig,
                 "maxdatacarriersize": self.mempool.max_datacarrier_bytes,
             }
+        if method == "estimatesmartfee":
+            return self._estimate_smart_fee(
+                self._param(params, 0, "conf_target"),
+                self._param(params, 1, "estimate_mode", "economical"),
+                self._param(params, 2, "options", {}),
+            )
+        if method == "estimaterawfee":
+            return self._estimate_raw_fee(
+                self._param(params, 0, "conf_target"),
+                self._param(params, 1, "threshold", 0.95),
+            )
         if method == "savemempool":
             if self.save_mempool is None:
                 raise RPCError(-32603, "Mempool persistence is not configured")
@@ -233,6 +284,24 @@ class NodeRPC:
             if entry is None:
                 raise RPCError(-5, "Transaction not in mempool")
             return self._mempool_entry_json(entry)
+        if method in ("getmempoolancestors", "getmempooldescendants"):
+            txid = self._parse_hash(self._param(params, 0, "txid"))
+            if txid not in self.mempool.entries:
+                raise RPCError(-5, "Transaction not in mempool")
+            verbose = self._param(params, 1, "verbose", False)
+            if not isinstance(verbose, bool):
+                raise RPCError(-3, "verbose must be a boolean")
+            related = (
+                self._ancestors(txid)
+                if method == "getmempoolancestors"
+                else self._descendants(txid)
+            )
+            if not verbose:
+                return [item[::-1].hex() for item in sorted(related)]
+            return {
+                item[::-1].hex(): self._mempool_entry_json(self.mempool.entries[item])
+                for item in sorted(related)
+            }
         if method == "prioritisetransaction":
             txid = self._parse_hash(self._param(params, 0, "txid"))
             if isinstance(params, dict):
@@ -296,21 +365,229 @@ class NodeRPC:
                 raise RPCError(-22, "Block decode failed") from exc
             return await self.submit_block(block)
         if method == "getnetworkinfo":
+            services = NODE_NETWORK | NODE_COMPACT_FILTERS
+            service_names = []
+            if services & NODE_NETWORK:
+                service_names.append("NETWORK")
+            if services & NODE_COMPACT_FILTERS:
+                service_names.append("COMPACT_FILTERS")
+            relay_fee = self.mempool.min_relay_fee_per_kvb / 100_000_000
+            peers = self.peers()
+            time_offsets = [
+                peer.time_offset
+                for peer in peers
+                if peer.established and not peer.inbound and peer.time_offset is not None
+            ]
             return {
                 "version": 1,
                 "subversion": "/bitcoin-py:0.1/",
                 "protocolversion": 70_016,
-                "networkactive": True,
-                "connections": sum(peer.established for peer in self.peers()),
-                "connections_in": sum(peer.established and peer.inbound for peer in self.peers()),
-                "connections_out": sum(peer.established and not peer.inbound for peer in self.peers()),
-                "relayfee": self.mempool.min_relay_fee_per_kvb / 100_000_000,
+                "localservices": f"{services:016x}",
+                "localservicesnames": service_names,
+                "localrelay": True,
+                "timeoffset": _truncated_median(time_offsets),
+                "networkactive": self.network_active(),
+                "connections": sum(peer.established for peer in peers),
+                "connections_in": sum(peer.established and peer.inbound for peer in peers),
+                "connections_out": sum(peer.established and not peer.inbound for peer in peers),
+                "relayfee": relay_fee,
+                "incrementalfee": relay_fee,
+                "networks": [
+                    {
+                        "name": name,
+                        "limited": not reachable,
+                        "reachable": reachable,
+                        "proxy": "",
+                        "proxy_randomize_credentials": False,
+                    }
+                    for name, reachable in (
+                        ("ipv4", True),
+                        ("ipv6", True),
+                        ("onion", False),
+                        ("i2p", False),
+                        ("cjdns", False),
+                    )
+                ],
+                "localaddresses": [],
+                "warnings": [],
             }
         if method == "getconnectioncount":
             return sum(peer.established for peer in self.peers())
+        if method == "ping":
+            await asyncio.gather(
+                *(peer.request_ping() for peer in self.peers() if peer.established),
+                return_exceptions=True,
+            )
+            return None
+        if method == "getnettotals":
+            peers = self.peers()
+            sent_total, received_total = self.network_totals()
+            return {
+                "totalbytesrecv": received_total + sum(peer.bytes_received for peer in peers),
+                "totalbytessent": sent_total + sum(peer.bytes_sent for peer in peers),
+                "timemillis": time.time_ns() // 1_000_000,
+                "uploadtarget": {
+                    "timeframe": 86_400,
+                    "target": 0,
+                    "target_reached": False,
+                    "serve_historical_blocks": True,
+                    "bytes_left_in_cycle": 0,
+                    "time_left_in_cycle": 0,
+                },
+            }
         if method == "getpeerinfo":
             return [self._peer_info(peer, peer_id) for peer_id, peer in enumerate(self.peers())]
+        if method == "getnodeaddresses":
+            count = self._param(params, 0, "count", 1)
+            network = self._param(params, 1, "network")
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or not 0 <= count <= 0x7FFFFFFF
+            ):
+                raise RPCError(-8, "Address count out of range")
+            network_ids = {"ipv4": 1, "ipv6": 2, "onion": 4, "i2p": 5, "cjdns": 6}
+            if network is not None and (
+                not isinstance(network, str) or network.lower() not in network_ids
+            ):
+                raise RPCError(-8, f"Network not recognized: {network}")
+            if self.address_book is None:
+                return []
+            records = self.address_book.known(
+                count,
+                network_id=network_ids[network.lower()] if network is not None else None,
+            )
+            return [self._node_address_info(record) for record in records]
+        if method == "setnetworkactive":
+            state = self._param(params, 0, "state")
+            if not isinstance(state, bool):
+                raise RPCError(-8, "state must be a boolean")
+            if self.set_network_active is None:
+                raise RPCError(-32603, "P2P network control is not configured")
+            return self.set_network_active(state)
+        if method == "disconnectnode":
+            address = self._param(params, 0, "address")
+            node_id = self._param(params, 1, "nodeid")
+            if address is not None and not isinstance(address, str):
+                raise RPCError(-32602, "address must be a string")
+            if node_id is not None and (
+                isinstance(node_id, bool) or not isinstance(node_id, int) or node_id < 0
+            ):
+                raise RPCError(-32602, "nodeid must be a non-negative integer")
+            if not (
+                (address not in (None, "") and node_id is None)
+                or (node_id is not None and address in (None, ""))
+            ):
+                raise RPCError(-32602, "Only one of address and nodeid should be provided")
+            if self.disconnect_peer is None:
+                raise RPCError(-32603, "P2P peer control is not configured")
+            if not await self.disconnect_peer(address, node_id):
+                raise RPCError(-29, "Node not found in connected nodes")
+            return None
+        if method == "addnode":
+            node = self._param(params, 0, "node")
+            command = self._param(params, 1, "command")
+            v2transport = self._param(params, 2, "v2transport", False)
+            if not isinstance(node, str) or not node.strip():
+                raise RPCError(-8, "Node address cannot be empty")
+            if not isinstance(command, str) or command not in {"add", "remove", "onetry"}:
+                raise RPCError(-8, "command must be add, remove, or onetry")
+            if not isinstance(v2transport, bool):
+                raise RPCError(-8, "v2transport must be a boolean")
+            if v2transport:
+                raise RPCError(-8, "v2 transport is not enabled")
+            if self.manage_added_node is None:
+                raise RPCError(-32603, "Added-node management is not configured")
+            try:
+                await self.manage_added_node(node, command)
+            except ValueError as exc:
+                code = -23 if "already added" in str(exc).lower() else -24 if command == "remove" else -8
+                raise RPCError(code, str(exc)) from exc
+            return None
+        if method == "getaddednodeinfo":
+            node = self._param(params, 0, "node")
+            if node is not None and not isinstance(node, str):
+                raise RPCError(-3, "node must be a string")
+            if self.added_node_info is None:
+                raise RPCError(-32603, "Added-node information is not configured")
+            try:
+                return self.added_node_info(node)
+            except ValueError as exc:
+                raise RPCError(-24, str(exc)) from exc
+        if method == "setban":
+            subnet_text = self._param(params, 0, "subnet")
+            command = self._param(params, 1, "command")
+            bantime = self._param(params, 2, "bantime", 0)
+            absolute = self._param(params, 3, "absolute", False)
+            bantime = 0 if bantime is None else bantime
+            absolute = False if absolute is None else absolute
+            if self.ban_manager is None:
+                raise RPCError(-32603, "Peer banning is not configured")
+            if not isinstance(subnet_text, str):
+                raise RPCError(-32602, "subnet must be a string")
+            if command not in {"add", "remove"}:
+                raise RPCError(-32602, "command must be add or remove")
+            if isinstance(bantime, bool) or not isinstance(bantime, int) or bantime < 0:
+                raise RPCError(-8, "bantime must be a non-negative integer")
+            if not isinstance(absolute, bool):
+                raise RPCError(-3, "absolute must be a boolean")
+            try:
+                subnet = parse_subnet(subnet_text)
+            except ValueError as exc:
+                raise RPCError(-30, str(exc)) from exc
+            if command == "add":
+                if any(record.subnet == subnet for record in self.ban_manager.list()):
+                    raise RPCError(-23, "IP/Subnet already banned")
+                try:
+                    self.ban_manager.ban(subnet, bantime, absolute=absolute)
+                except ValueError as exc:
+                    raise RPCError(-8, str(exc)) from exc
+                if self.disconnect_banned is not None:
+                    await self.disconnect_banned(subnet)
+            elif not self.ban_manager.unban(subnet):
+                raise RPCError(-30, "Requested IP/Subnet was not previously banned")
+            return None
+        if method == "listbanned":
+            if self.ban_manager is None:
+                raise RPCError(-32603, "Peer banning is not configured")
+            now = int(time.time())
+            return [record.to_rpc(now) for record in self.ban_manager.list(now=now)]
+        if method == "clearbanned":
+            if self.ban_manager is None:
+                raise RPCError(-32603, "Peer banning is not configured")
+            self.ban_manager.clear()
+            return None
         raise RPCError(-32601, f"Method not found: {method}")
+
+    @staticmethod
+    def _node_address_info(record) -> dict[str, Any]:
+        if record.network_id == 1:
+            address = str(ipaddress.IPv4Address(record.address_bytes))
+            network = "ipv4"
+        elif record.network_id == 2:
+            address = str(ipaddress.IPv6Address(record.address_bytes))
+            network = "ipv6"
+        elif record.network_id == 4:
+            key = record.address_bytes
+            checksum = hashlib.sha3_256(b".onion checksum" + key + b"\x03").digest()[:2]
+            address = base64.b32encode(key + checksum + b"\x03").decode("ascii").lower().rstrip("=") + ".onion"
+            network = "onion"
+        elif record.network_id == 5:
+            address = base64.b32encode(record.address_bytes).decode("ascii").lower().rstrip("=") + ".b32.i2p"
+            network = "i2p"
+        elif record.network_id == 6:
+            address = str(ipaddress.IPv6Address(record.address_bytes))
+            network = "cjdns"
+        else:
+            address = record.address_bytes.hex()
+            network = "unknown"
+        return {
+            "time": record.timestamp,
+            "services": record.services,
+            "address": address,
+            "port": record.port,
+            "network": network,
+        }
 
     async def _wait_for_template_change(self, longpollid: Any) -> None:
         """Wait until the active tip or transaction pool changes from a GBT ID."""
@@ -356,6 +633,176 @@ class NodeRPC:
             raise RPCError(-8, "Hash must contain 32 bytes")
         return decoded[::-1]
 
+    def _estimate_smart_fee(self, target: Any, mode: Any, options: Any) -> dict[str, Any]:
+        """Estimate a short-horizon fee from recent mempool-representative blocks."""
+        if isinstance(target, bool) or not isinstance(target, int) or not 1 <= target <= 1_008:
+            raise RPCError(-8, "Confirmation target must be between 1 and 1008 blocks")
+        if not isinstance(mode, str) or mode.lower() not in ("unset", "economical", "conservative"):
+            raise RPCError(-8, "Invalid estimate_mode; use unset, economical, or conservative")
+        if options is None:
+            options = {}
+        if not isinstance(options, dict):
+            raise RPCError(-3, "options must be an object")
+        if set(options) - {"fee_rate_estimator", "verbosity"}:
+            raise RPCError(-8, "Unknown estimatesmartfee option")
+        estimator_type = options.get("fee_rate_estimator", "auto")
+        if not isinstance(estimator_type, str) or estimator_type not in (
+            "auto",
+            "mempool_policy",
+            "block_policy",
+        ):
+            raise RPCError(-8, 'fee_rate_estimator must be "auto", "block_policy", or "mempool_policy"')
+        verbosity = options.get("verbosity", 1)
+        if isinstance(verbosity, bool) or not isinstance(verbosity, int):
+            raise RPCError(-3, "verbosity must be an integer")
+
+        conservative = mode.lower() == "conservative"
+        policy_estimator = self.block_policy_estimator
+        mempool_estimator = self.fee_estimator
+        policy_rate = None
+        policy_target = target
+        if policy_estimator is not None:
+            policy_rate, policy_target = policy_estimator.estimate_smart_fee(
+                target, conservative=conservative
+            )
+        mempool_rate = None
+        if mempool_estimator is not None:
+            estimated_sat_vb, _error = mempool_estimator.estimate(conservative=conservative)
+            if estimated_sat_vb is not None:
+                mempool_rate = estimated_sat_vb * 1_000
+
+        selected_rate: float | None
+        selected_target: int
+        selected_estimator: str | None = None
+        if estimator_type == "block_policy":
+            selected_rate, selected_target = policy_rate, policy_target
+            selected_estimator = "block_policy"
+        elif estimator_type == "mempool_policy":
+            selected_rate, selected_target = mempool_rate, 2
+            selected_estimator = "mempool_policy"
+        else:
+            if policy_rate is None:
+                selected_rate, selected_target = None, policy_target
+            elif mempool_rate is not None and mempool_rate < policy_rate:
+                selected_rate, selected_target = mempool_rate, 2
+                selected_estimator = "mempool_policy"
+            else:
+                selected_rate, selected_target = policy_rate, policy_target
+                selected_estimator = "block_policy"
+
+        result: dict[str, Any] = {"blocks": selected_target}
+        if selected_rate is None:
+            result["errors"] = ["Insufficient data or no feerate found"]
+        else:
+            fee_per_kvb = max(int(selected_rate), self.mempool.min_relay_fee_per_kvb)
+            result["feerate"] = fee_per_kvb / 100_000_000
+            if estimator_type == "auto":
+                result["estimator"] = selected_estimator
+        if verbosity >= 2 and mempool_estimator is not None:
+            result["mempool_health_statistics"] = [
+                {
+                    "block_height": block.height,
+                    "block_weight": block.block_weight,
+                    "mempool_txs_weight": block.mempool_txs_weight,
+                }
+                for block in reversed(mempool_estimator.recent_blocks())
+            ]
+        return result
+
+    def _estimate_raw_fee(self, target: Any, threshold: Any) -> dict[str, Any]:
+        """Return the detailed fee-bucket data used by the block-policy estimator."""
+        if isinstance(target, bool) or not isinstance(target, int) or not 1 <= target <= 1_008:
+            raise RPCError(-8, "Confirmation target must be between 1 and 1008 blocks")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise RPCError(-3, "threshold must be numeric")
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise RPCError(-8, "Invalid threshold")
+        if self.block_policy_estimator is None:
+            raise RPCError(-32603, "Block-policy fee estimation is not configured")
+
+        def rounded(value: float, decimals: int = 0) -> float:
+            factor = 10**decimals
+            return math.floor(value * factor + 0.5) / factor
+
+        def bucket_json(bucket) -> dict[str, float]:
+            return {
+                "startrange": rounded(bucket.start),
+                "endrange": rounded(bucket.end),
+                "withintarget": rounded(bucket.within_target, 2),
+                "totalconfirmed": rounded(bucket.total_confirmed, 2),
+                "inmempool": rounded(bucket.in_mempool, 2),
+                "leftmempool": rounded(bucket.left_mempool, 2),
+            }
+
+        estimator = self.block_policy_estimator
+        result: dict[str, Any] = {}
+        for name, maximum in (("short", 12), ("medium", 48), ("long", 1_008)):
+            if target > maximum:
+                continue
+            feerate, stats = estimator.estimate_raw_fee(target, float(threshold), name)
+            item: dict[str, Any] = {"decay": stats.decay, "scale": stats.scale}
+            if feerate > 0:
+                item["feerate"] = feerate / 100_000_000
+                item["pass"] = bucket_json(stats.pass_bucket)
+                if stats.fail_bucket.start != -1:
+                    item["fail"] = bucket_json(stats.fail_bucket)
+            else:
+                item["fail"] = bucket_json(stats.fail_bucket)
+                item["errors"] = ["Insufficient data or no feerate found which meets threshold"]
+            result[name] = item
+        return result
+
+    def _deployment_info(self, block_hash_value: Any = None) -> dict[str, Any]:
+        """Report BIP9 state and signalling statistics for a selected block."""
+        if block_hash_value is None:
+            best = self.store.best_block()
+            index = self.headers.indexes.get(best) if best is not None else None
+        else:
+            block_hash = self._parse_hash(block_hash_value)
+            index = self.headers.indexes.get(block_hash)
+            if index is None:
+                raise RPCError(-5, "Block not found")
+        if index is None:
+            raise RPCError(-32603, "Active chain is unavailable")
+
+        deployments: dict[str, Any] = {}
+        for name, deployment in self.params.versionbits_deployments:
+            if deployment.start_time == NEVER_ACTIVE:
+                continue
+            checker = self._versionbits.setdefault(name, VersionBits(deployment))
+            info = checker.info(index)
+            bip9: dict[str, Any] = {
+                "start_time": deployment.start_time,
+                "timeout": deployment.timeout,
+                "min_activation_height": deployment.min_activation_height,
+                "status": info.current_state.value,
+                "since": info.since,
+                "status_next": info.next_state.value,
+            }
+            active = False
+            if info.active_since is not None:
+                bip9["height"] = info.active_since
+                active = info.active_since <= index.height + 1
+            if info.stats is not None:
+                stats = info.stats
+                bip9["bit"] = deployment.bit
+                statistics: dict[str, Any] = {
+                    "period": stats.period,
+                    "elapsed": stats.elapsed,
+                    "count": stats.count,
+                }
+                if stats.threshold > 0 or stats.possible:
+                    statistics["threshold"] = stats.threshold
+                    statistics["possible"] = stats.possible
+                bip9["statistics"] = statistics
+                bip9["signalling"] = "".join("#" if signalled else "-" for signalled in stats.signalling_blocks)
+            deployments[name] = {"type": "bip9", "active": active, "bip9": bip9}
+        return {
+            "hash": index.block_hash[::-1].hex(),
+            "height": index.height,
+            "deployments": deployments,
+        }
+
     def _get_block_header(self, block_hash_value: Any, verbose: bool) -> Any:
         block_hash = self._parse_hash(block_hash_value)
         raw_header = self.store.load_header(block_hash)
@@ -389,8 +836,7 @@ class NodeRPC:
             result["previousblockhash"] = header.previous_block[::-1].hex()
         return result
 
-    @staticmethod
-    def _transaction_json(tx: Transaction) -> dict[str, Any]:
+    def _transaction_json(self, tx: Transaction) -> dict[str, Any]:
         raw = tx.serialize(include_witness=True)
         stripped = tx.serialize(include_witness=False)
         return {
@@ -406,7 +852,7 @@ class NodeRPC:
                  if txin.previous_output.is_null else {
                      "txid": txin.previous_output.txid[::-1].hex(),
                      "vout": txin.previous_output.index,
-                     "scriptSig": {"asm": "", "hex": txin.script_sig.hex()},
+                     "scriptSig": {"asm": script_to_asm(txin.script_sig), "hex": txin.script_sig.hex()},
                      "txinwitness": [item.hex() for item in txin.witness] if txin.witness else [],
                      "sequence": txin.sequence,
                  })
@@ -416,7 +862,7 @@ class NodeRPC:
                 {
                     "value": output.value / 100_000_000,
                     "n": index,
-                    "scriptPubKey": {"asm": "", "hex": output.script_pubkey.hex(), "type": "nonstandard"},
+                    "scriptPubKey": script_pubkey_json(output.script_pubkey, self.network_name),
                 }
                 for index, output in enumerate(tx.outputs)
             ],
@@ -430,11 +876,12 @@ class NodeRPC:
         tx = self.mempool.get(txid) if requested_block is None else None
         block_hash = None
         height = None
+        block_position = None
         if tx is None:
             indexed = self.store.find_transaction(txid)
             if indexed is None or (requested_block is not None and indexed[0] != requested_block):
                 raise RPCError(-5, "Transaction not found in mempool or specified block")
-            block_hash, height, _position, tx = indexed
+            block_hash, height, block_position, tx = indexed
         raw = tx.serialize(include_witness=True)
         if verbosity is False or verbosity == 0:
             return raw.hex()
@@ -442,7 +889,15 @@ class NodeRPC:
         result["hex"] = raw.hex()
         if verbosity == 2:
             result["vin"] = [
-                {**item, "prevout": self._prevout_json(txin.previous_output.txid, txin.previous_output.index)}
+                {
+                    **item,
+                    "prevout": self._prevout_json(
+                        txin.previous_output.txid,
+                        txin.previous_output.index,
+                        block_hash=block_hash,
+                        block_position=block_position,
+                    ),
+                }
                 if not txin.previous_output.is_null else item
                 for item, txin in zip(result["vin"], tx.inputs)
             ]
@@ -451,16 +906,45 @@ class NodeRPC:
             result["confirmations"] = self.store.best_height() - height + 1
         return result
 
-    def _prevout_json(self, txid: bytes, output_index: int) -> dict[str, Any] | None:
+    def _prevout_json(
+        self,
+        txid: bytes,
+        output_index: int,
+        *,
+        block_hash: bytes | None = None,
+        block_position: int | None = None,
+    ) -> dict[str, Any] | None:
         block_coin = self.coins.coins.get((txid, output_index))
         parent = self.mempool.get(txid)
         if block_coin is not None:
             return {"value": block_coin.value / 100_000_000,
-                    "scriptPubKey": {"asm": "", "hex": block_coin.script_pubkey.hex(), "type": "nonstandard"}}
+                    "scriptPubKey": script_pubkey_json(block_coin.script_pubkey, self.network_name)}
         if parent is not None and output_index < len(parent.outputs):
             output = parent.outputs[output_index]
             return {"value": output.value / 100_000_000,
-                    "scriptPubKey": {"asm": "", "hex": output.script_pubkey.hex(), "type": "nonstandard"}}
+                    "scriptPubKey": script_pubkey_json(output.script_pubkey, self.network_name)}
+        if block_hash is not None:
+            undo = self.store.load_undo(block_hash)
+            if undo is not None:
+                coin = next(
+                    (coin for outpoint, coin in undo.spent if outpoint == (txid, output_index)),
+                    None,
+                )
+                if coin is not None:
+                    return {
+                        "value": coin.value / 100_000_000,
+                        "scriptPubKey": script_pubkey_json(coin.script_pubkey, self.network_name),
+                    }
+            if block_position is not None:
+                block = self.store.load_block(block_hash)
+                if block is not None:
+                    for parent_tx in block.transactions[:block_position]:
+                        if parent_tx.txid == txid and output_index < len(parent_tx.outputs):
+                            output = parent_tx.outputs[output_index]
+                            return {
+                                "value": output.value / 100_000_000,
+                                "scriptPubKey": script_pubkey_json(output.script_pubkey, self.network_name),
+                            }
         return None
 
     def _get_block(self, block_hash_value: Any, verbosity: Any) -> Any:
@@ -530,11 +1014,7 @@ class NodeRPC:
                             "generated": generated,
                             "height": height,
                             "value": amount / 100_000_000,
-                            "scriptPubKey": {
-                                "asm": "",
-                                "hex": script.hex(),
-                                "type": "nonstandard",
-                            },
+                            "scriptPubKey": script_pubkey_json(script, self.network_name),
                         },
                     })
                 tx_json["vin"] = inputs
@@ -627,7 +1107,7 @@ class NodeRPC:
             "csv": self.params.csv_height,
             "segwit": self.params.segwit_height,
         }
-        return {
+        result = {
             "chain": self.network_name,
             "blocks": height,
             "headers": header_tip.height if header_tip else -1,
@@ -641,6 +1121,9 @@ class NodeRPC:
                 if activation is not None
             },
         }
+        if self.params.signet_challenge:
+            result["signet_challenge"] = self.params.signet_challenge.hex()
+        return result
 
     def _active_difficulty(self) -> float:
         block_hash = self.store.best_block()
@@ -652,6 +1135,80 @@ class NodeRPC:
         bits = BlockHeader.deserialize(raw_header).bits
         target, negative, overflow = decode_compact_target(bits)
         return 0.0 if negative or overflow or not target else self.params.pow_limit / target
+
+    def _network_hash_ps(self, lookup: Any, height: Any) -> float:
+        """Estimate hashes per second from active-chain work and timestamps."""
+        if isinstance(lookup, bool) or not isinstance(lookup, int) or lookup < -1 or lookup == 0:
+            raise RPCError(-8, "nblocks must be a positive number or -1")
+        if isinstance(height, bool) or not isinstance(height, int) or height < -1:
+            raise RPCError(-8, "height must be -1 or a non-negative block height")
+        tip_hash = self.store.best_block()
+        tip = self.headers.indexes.get(tip_hash) if tip_hash is not None else None
+        if tip is None:
+            return 0.0
+        if height > tip.height:
+            raise RPCError(-8, "Block does not exist at specified height")
+        block = tip if height == -1 else tip.ancestor(height)
+        if block is None or block.height == 0:
+            return 0.0
+        if lookup == -1:
+            lookup = block.height % self.params.difficulty_adjustment_interval + 1
+        lookup = min(lookup, block.height)
+        first = block.ancestor(block.height - lookup)
+        if first is None:
+            return 0.0
+        timestamps = []
+        cursor = block
+        for _ in range(lookup + 1):
+            timestamps.append(cursor.header.timestamp)
+            if cursor is first:
+                break
+            if cursor.previous is None:
+                break
+            cursor = cursor.previous
+        elapsed = max(timestamps) - min(timestamps)
+        if elapsed == 0:
+            return 0.0
+        return (block.chainwork - first.chainwork) / elapsed
+
+    def _mining_info(self) -> dict[str, Any]:
+        """Return mining status and current/next proof-of-work targets."""
+        best_hash = self.store.best_block()
+        tip = self.headers.indexes.get(best_hash) if best_hash is not None else None
+        if tip is None:
+            raise RPCError(-32603, "Active chain is unavailable")
+        current_target, negative, overflow = decode_compact_target(tip.header.bits)
+        if negative or overflow or current_target <= 0:
+            raise RPCError(-32603, "Active block has an invalid proof-of-work target")
+        next_time = max(int(time.time()), tip.median_time_past + 1)
+        try:
+            next_bits = expected_work_bits(tip, next_time, self.params)
+        except ValueError as exc:
+            raise RPCError(-32603, "Unable to calculate next proof-of-work target") from exc
+        next_target, negative, overflow = decode_compact_target(next_bits)
+        if negative or overflow or next_target <= 0:
+            raise RPCError(-32603, "Next block has an invalid proof-of-work target")
+        result = {
+            "blocks": tip.height,
+            "bestblockhash": tip.block_hash[::-1].hex(),
+            "bits": f"{tip.header.bits:08x}",
+            "difficulty": self.params.pow_limit / current_target,
+            "target": f"{current_target:064x}",
+            "networkhashps": self._network_hash_ps(120, -1),
+            "pooledtx": len(self.mempool.entries),
+            "blockmintxfee": self.mempool.min_relay_fee_per_kvb / 100_000_000,
+            "chain": self.network_name,
+            "next": {
+                "height": tip.height + 1,
+                "bits": f"{next_bits:08x}",
+                "difficulty": self.params.pow_limit / next_target,
+                "target": f"{next_target:064x}",
+            },
+            "warnings": [],
+        }
+        if self.params.signet_challenge:
+            result["signet_challenge"] = self.params.signet_challenge.hex()
+        return result
 
     def _chain_tx_stats(self, window_blocks: Any, block_hash_value: Any) -> dict[str, Any]:
         """Compute Core-compatible cumulative and windowed active-chain tx statistics."""
@@ -984,36 +1541,235 @@ class NodeRPC:
             result.append(response)
         return result
 
-    @staticmethod
-    def _peer_info(peer: PeerConnection, peer_id: int) -> dict[str, Any]:
+    def _test_mempool_accept(
+        self,
+        raw_transactions: Any,
+        max_fee_rate: Any,
+        max_burn_amount: Any,
+    ) -> list[dict[str, Any]]:
+        """Evaluate a transaction package against a disposable mempool copy."""
+        if self.relay is None:
+            raise RPCError(-32603, "Transaction admission is not configured")
+        if not isinstance(raw_transactions, list) or not raw_transactions:
+            raise RPCError(-8, "rawtxs must be a non-empty array")
+        if len(raw_transactions) > 25:
+            raise RPCError(-8, "Package cannot exceed 25 transactions")
+        if (
+            isinstance(max_fee_rate, bool)
+            or not isinstance(max_fee_rate, (int, float))
+            or not math.isfinite(max_fee_rate)
+            or max_fee_rate < 0
+            or max_fee_rate > 21_000_000
+        ):
+            raise RPCError(-3, "maxfeerate must be a non-negative number")
+        if (
+            isinstance(max_burn_amount, bool)
+            or not isinstance(max_burn_amount, (int, float))
+            or not math.isfinite(max_burn_amount)
+            or max_burn_amount < 0
+            or max_burn_amount > 21_000_000
+        ):
+            raise RPCError(-3, "maxburnamount must be a non-negative number")
+
+        transactions = []
+        indexes: dict[bytes, int] = {}
+        for position, raw_hex in enumerate(raw_transactions):
+            if not isinstance(raw_hex, str):
+                raise RPCError(-3, "Each raw transaction must be hexadecimal text")
+            try:
+                transaction = Transaction.deserialize(bytes.fromhex(raw_hex))
+            except (EOFError, ValueError) as exc:
+                raise RPCError(-22, "TX decode failed") from exc
+            if transaction.txid in indexes:
+                raise RPCError(-8, "Package contains duplicate transactions")
+            indexes[transaction.txid] = position
+            transactions.append(transaction)
+
+        ordered: list[Transaction] = []
+        remaining = set(indexes)
+        by_txid = {transaction.txid: transaction for transaction in transactions}
+        while remaining:
+            ready = [
+                txid
+                for txid in remaining
+                if not any(
+                    txin.previous_output.txid in remaining
+                    for txin in by_txid[txid].inputs
+                )
+            ]
+            if not ready:
+                # Keep cyclic packages in caller order; normal admission will
+                # provide each transaction's concrete consensus-policy error.
+                ordered.extend(
+                    by_txid[txid]
+                    for txid in sorted(remaining, key=indexes.__getitem__)
+                )
+                break
+            ready.sort(key=indexes.__getitem__)
+            for txid in ready:
+                ordered.append(by_txid[txid])
+                remaining.remove(txid)
+
+        working = copy.deepcopy(self.mempool)
+        outcomes: dict[bytes, tuple[bool, str | None, MempoolEntry | None]] = {}
+        max_fee_rate_sats_per_kvb = int(max_fee_rate * 100_000_000)
+        max_burn_sats = int(max_burn_amount * 100_000_000)
+        for transaction in ordered:
+            txid = transaction.txid
+            burn = sum(
+                output.value
+                for output in transaction.outputs
+                if output.script_pubkey.startswith(b"\x6a")
+            )
+            if burn > max_burn_sats:
+                outcomes[txid] = (False, "max-burn-amount-exceeded", None)
+                continue
+            try:
+                entry = working.accept(
+                    transaction,
+                    self.relay.coins(),
+                    self.relay.height(),
+                    input_verifier=self.relay.input_verifier,
+                    median_time_past=self.relay.median_time_past(),
+                )
+            except MempoolError as exc:
+                outcomes[txid] = (False, str(exc), None)
+                continue
+            if max_fee_rate_sats_per_kvb and entry.fee * 1_000 > max_fee_rate_sats_per_kvb * entry.vsize:
+                working.remove(txid, recursive=True)
+                outcomes[txid] = (False, "max-fee-exceeded", entry)
+                continue
+            outcomes[txid] = (True, None, entry)
+
+        result = []
+        for transaction in transactions:
+            txid = transaction.txid
+            allowed, reason, entry = outcomes[txid]
+            if allowed and txid not in working.entries:
+                allowed, reason = False, "replaced or evicted by another package transaction"
+            item: dict[str, Any] = {
+                "txid": txid[::-1].hex(),
+                "wtxid": transaction.wtxid[::-1].hex(),
+                "allowed": allowed,
+            }
+            if entry is not None:
+                item["vsize"] = entry.vsize
+                item["fees"] = {
+                    "base": entry.fee / 100_000_000,
+                    "effective-feerate": entry.modified_fee * 1_000 / entry.vsize / 100_000_000,
+                    "effective-includes": [],
+                }
+            if reason is not None:
+                item["reject-reason"] = reason
+            result.append(item)
+        return result
+
+    def _peer_info(self, peer: PeerConnection, peer_id: int) -> dict[str, Any]:
         remote = peer.handshake.remote_version
         address = peer.address
         host = address[0] if address else ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
+        services = remote.services if remote else 0
+        result_address = NodeRPC._format_endpoint(host, address[1]) if address else ""
+        local_socket = peer.writer.get_extra_info("sockname")
         result = {
-            "id": peer_id,
-            "addr": f"{host}:{address[1]}" if address else "",
+            "id": peer.peer_id if peer.peer_id is not None else peer_id,
+            "addr": result_address,
+            "conntime": peer.connection_time,
+            "lastsend": peer.last_send,
+            "lastrecv": peer.last_receive,
+            "bytessent": peer.bytes_sent,
+            "bytesrecv": peer.bytes_received,
+            "bytessent_per_msg": {
+                command: size
+                for command, size in sorted(peer.bytes_sent_per_msg.items())
+                if size > 0
+            },
+            "bytesrecv_per_msg": {
+                command: size
+                for command, size in sorted(peer.bytes_received_per_msg.items())
+                if size > 0
+            },
             "inbound": peer.inbound,
             "connected": peer.established,
+            "network": NodeRPC._peer_network(peer),
             "version": remote.protocol_version if remote else 0,
             "subver": remote.user_agent if remote else "",
-            "services": f"{remote.services:016x}" if remote else "0" * 16,
+            "services": f"{services:016x}",
+            "servicesnames": NodeRPC._service_names(services),
+            "timeoffset": peer.time_offset if peer.time_offset is not None else 0,
             "startingheight": remote.start_height if remote else -1,
             "minfeefilter": peer.fee_filter / 100_000_000,
-            "connection_type": "inbound" if peer.inbound else "outbound-full-relay",
+            "connection_type": peer.connection_type,
             "transport_protocol_type": "v1",
+            "bip152_hb_to": False,
+            "bip152_hb_from": False,
+            "presynced_headers": -1,
+            "inflight": self.peer_inflight_blocks(peer),
+            "addr_relay_enabled": peer.addr_relay_enabled,
+            "addr_processed": peer.addr_processed,
+            "addr_rate_limited": peer.addr_rate_limited,
+            "permissions": [],
             "wtxidrelay": (
                 peer.handshake.sent_wtxidrelay
                 and peer.handshake.received_wtxidrelay
             ),
+            "relaytxes": remote.relay if remote and remote.relay is not None else True,
         }
+        if local_socket is not None:
+            result["addrbind"] = NodeRPC._format_endpoint(str(local_socket[0]), local_socket[1])
+        if remote is not None:
+            local_address = remote.receiver
+            if not local_address.ip.is_unspecified and local_address.port:
+                result["addrlocal"] = NodeRPC._format_endpoint(
+                    str(local_address.ip), local_address.port
+                )
         if peer.ping_time is not None:
             result["pingtime"] = peer.ping_time
+        if peer.min_ping_time is not None:
+            result["minping"] = peer.min_ping_time
         ping_wait = peer.ping_wait
         if ping_wait is not None:
             result["pingwait"] = ping_wait
         return result
+
+    @staticmethod
+    def _format_endpoint(host: str, port: int) -> str:
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{host}:{port}"
+
+    @staticmethod
+    def _service_names(services: int) -> list[str]:
+        names = []
+        known = {
+            0: "NETWORK",
+            2: "BLOOM",
+            3: "WITNESS",
+            6: "COMPACT_FILTERS",
+            10: "NETWORK_LIMITED",
+            11: "P2P_V2",
+        }
+        for bit in range(64):
+            if services & (1 << bit):
+                names.append(known.get(bit, f"UNKNOWN[2^{bit}]"))
+        return names
+
+    @staticmethod
+    def _peer_network(peer: PeerConnection) -> str:
+        address = peer.address
+        if address is None:
+            return "not_publicly_routable"
+        try:
+            ip = ipaddress.ip_address(address[0])
+        except ValueError:
+            return "not_publicly_routable"
+        if isinstance(ip, ipaddress.IPv4Address) or (
+            isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None
+        ):
+            return "ipv4"
+        if isinstance(ip, ipaddress.IPv6Address) and ip.packed[0] == 0xFC:
+            return "cjdns"
+        return "ipv6"
 
     def _get_txout(self, txid_value: Any, output_index: Any, include_mempool: bool) -> dict[str, Any] | None:
         txid = self._parse_hash(txid_value)
@@ -1028,7 +1784,7 @@ class NodeRPC:
                 "bestblock": (self.store.best_block() or bytes(32))[::-1].hex(),
                 "confirmations": max(0, self.store.best_height() - coin.height + 1),
                 "value": coin.value / 100_000_000,
-                "scriptPubKey": {"asm": "", "hex": coin.script_pubkey.hex(), "type": "nonstandard"},
+                "scriptPubKey": script_pubkey_json(coin.script_pubkey, self.network_name),
                 "coinbase": coin.coinbase,
             }
         if include_mempool:
@@ -1039,7 +1795,7 @@ class NodeRPC:
                     "bestblock": (self.store.best_block() or bytes(32))[::-1].hex(),
                     "confirmations": 0,
                     "value": output.value / 100_000_000,
-                    "scriptPubKey": {"asm": "", "hex": output.script_pubkey.hex(), "type": "nonstandard"},
+                    "scriptPubKey": script_pubkey_json(output.script_pubkey, self.network_name),
                     "coinbase": False,
                 }
         return None

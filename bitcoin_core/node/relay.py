@@ -14,6 +14,8 @@ from bitcoin_core.node.mempool import MempoolEntry
 from bitcoin_core.node.orphanage import Orphanage
 from bitcoin_core.primitives.transaction import Transaction
 
+MAX_PENDING_TX_REQUESTS_PER_PEER = 50_000
+
 
 @dataclass(slots=True)
 class MempoolRelay:
@@ -75,6 +77,37 @@ class MempoolRelay:
                 except (ConnectionError, OSError):
                     continue
 
+    async def rebroadcast_unbroadcast(self, peers: list[PeerConnection]) -> int:
+        """Reannounce local transactions still pending after a chain update."""
+        entries = [
+            self.mempool.entries[txid]
+            for txid in sorted(self.mempool.unbroadcast_txs)
+            if txid in self.mempool.entries
+        ]
+        announced = 0
+        for peer in peers:
+            if not peer.established:
+                continue
+            wtxid_relay = (
+                peer.handshake.sent_wtxidrelay
+                and peer.handshake.received_wtxidrelay
+            )
+            inventory = [
+                InventoryVector(
+                    MSG_WTX if wtxid_relay else MSG_TX,
+                    entry.wtxid if wtxid_relay else entry.txid,
+                )
+                for entry in entries
+                if entry.fee * 1_000 >= peer.fee_filter * entry.vsize
+            ]
+            for start in range(0, len(inventory), 50_000):
+                try:
+                    await peer.send("inv", encode_inventory(inventory[start : start + 50_000]))
+                except (ConnectionError, OSError):
+                    break
+            announced = max(announced, len(inventory))
+        return announced
+
     def _missing_parents(self, transaction: Transaction) -> set[bytes]:
         coins = self.coins().coins
         missing = set()
@@ -129,6 +162,8 @@ class MempoolRelay:
             except (EOFError, ValueError):
                 await peer.close()
                 raise
+            peer.requested_transactions.discard((MSG_TX, tx.txid))
+            peer.requested_transactions.discard((MSG_WTX, tx.wtxid))
             try:
                 await self.submit(tx, [candidate for candidate in peers if candidate is not peer])
             except MempoolError:
@@ -151,12 +186,38 @@ class MempoolRelay:
                     transaction = self.mempool.get_by_wtxid(item.hash)
                     if transaction is not None:
                         self.mempool.unbroadcast_txs.discard(transaction.txid)
-                if item.type == MSG_TX and self.mempool.get(item.hash) is None:
-                    requests.append(item)
-                elif item.type == MSG_WTX and self.mempool.get_by_wtxid(item.hash) is None:
+                if item.type not in (MSG_TX, MSG_WTX):
+                    continue
+                known = (
+                    self.mempool.get(item.hash) is not None
+                    if item.type == MSG_TX
+                    else self.mempool.get_by_wtxid(item.hash) is not None
+                )
+                request_key = (item.type, item.hash)
+                if (
+                    not known
+                    and request_key not in peer.requested_transactions
+                    and len(peer.requested_transactions) < MAX_PENDING_TX_REQUESTS_PER_PEER
+                ):
+                    peer.requested_transactions.add(request_key)
                     requests.append(item)
             if requests:
-                await peer.send("getdata", encode_inventory(requests))
+                try:
+                    await peer.send("getdata", encode_inventory(requests))
+                except (ConnectionError, OSError):
+                    peer.requested_transactions.difference_update(
+                        (item.type, item.hash) for item in requests
+                    )
+            return True
+        if message.command == "notfound":
+            try:
+                missing = decode_inventory(message.payload)
+            except ValueError:
+                await peer.close()
+                raise
+            for item in missing:
+                if item.type in (MSG_TX, MSG_WTX):
+                    peer.requested_transactions.discard((item.type, item.hash))
             return True
         return False
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from bitcoin_core.consensus.versionbits import Deployment, NEVER_ACTIVE
+
 
 @dataclass(frozen=True, slots=True)
 class ConsensusParams:
@@ -25,6 +27,7 @@ class ConsensusParams:
     segwit_height: int | None = None
     script_flag_exceptions: tuple[tuple[bytes, int], ...] = ()
     bip30_exception_hashes: tuple[bytes, ...] = ()
+    versionbits_deployments: tuple[tuple[str, Deployment], ...] = ()
 
     def __post_init__(self) -> None:
         if not 0 < self.pow_limit < 1 << 256:
@@ -47,6 +50,9 @@ class ConsensusParams:
             raise ValueError("script flag exception hashes must be 32 bytes")
         if any(len(block_hash) != 32 for block_hash in self.bip30_exception_hashes):
             raise ValueError("BIP30 exception hashes must be 32 bytes")
+        names = [name for name, _deployment in self.versionbits_deployments]
+        if any(not name for name in names) or len(set(names)) != len(names):
+            raise ValueError("version-bits deployment names must be non-empty and unique")
 
     @property
     def difficulty_adjustment_interval(self) -> int:
@@ -72,6 +78,7 @@ MAINNET = ConsensusParams(
         bytes.fromhex("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")[::-1],
         bytes.fromhex("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")[::-1],
     ),
+    versionbits_deployments=(("testdummy", Deployment(28, NEVER_ACTIVE, NEVER_ACTIVE)),),
 )
 TESTNET = ConsensusParams(
     pow_limit=_MAINNET_POW_LIMIT,
@@ -86,6 +93,7 @@ TESTNET = ConsensusParams(
     script_flag_exceptions=(
         (bytes.fromhex("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105")[::-1], 0),
     ),
+    versionbits_deployments=(("testdummy", Deployment(28, NEVER_ACTIVE, NEVER_ACTIVE, threshold=1512)),),
 )
 REGTEST = ConsensusParams(
     pow_limit=_REGTEST_POW_LIMIT,
@@ -96,4 +104,5 @@ REGTEST = ConsensusParams(
     bip65_height=0,
     csv_height=0,
     segwit_height=0,
+    versionbits_deployments=(("testdummy", Deployment(28, 0, (1 << 63) - 1, period=144, threshold=108)),),
 )

@@ -9,6 +9,11 @@ from typing import Any
 from bitcoin_core.consensus.params import ConsensusParams
 from bitcoin_core.consensus.pow import decode_compact_target
 from bitcoin_core.consensus.subsidy import block_subsidy
+from bitcoin_core.consensus.versionbits import (
+    VERSIONBITS_TOP_BITS,
+    ThresholdState,
+    VersionBits,
+)
 from bitcoin_core.crypto.hashes import hash256
 from bitcoin_core.node.chain import BlockIndex, HeaderChain, expected_work_bits
 from bitcoin_core.node.mempool import Mempool, MempoolEntry
@@ -113,8 +118,9 @@ def create_block_template(
     previous: BlockIndex | None = headers.indexes.get(best_hash) if best_hash is not None else None
     if previous is None:
         raise ValueError("active chain is unavailable")
-    if params.signet_challenge:
-        raise ValueError("mining templates for signet are not supported")
+    signet_active = bool(params.signet_challenge)
+    if signet_active and "signet" not in client_rules:
+        raise ValueError("getblocktemplate must be called with the signet rule")
 
     height = previous.height + 1
     segwit_active = params.segwit_height is not None and height >= params.segwit_height
@@ -134,12 +140,31 @@ def create_block_template(
         rules.append("csv")
     if segwit_active:
         rules.extend(("!segwit", "taproot"))
+    if signet_active:
+        rules.append("!signet")
+
+    version = VERSIONBITS_TOP_BITS
+    vbavailable: dict[str, int] = {}
+    for name, deployment in params.versionbits_deployments:
+        state = VersionBits(deployment).state_for(previous)
+        gbt_name = name if deployment.gbt_optional_rule else f"!{name}"
+        if state in (ThresholdState.STARTED, ThresholdState.LOCKED_IN):
+            vbavailable[gbt_name] = deployment.bit
+            version |= deployment.mask
+            if state is ThresholdState.LOCKED_IN and not deployment.gbt_optional_rule and name not in client_rules:
+                version &= ~deployment.mask
+        elif state is ThresholdState.ACTIVE:
+            active_rule = gbt_name
+            if active_rule.startswith("!") and name not in client_rules:
+                raise ValueError(f"client must include the {name} rule")
+            if active_rule not in rules:
+                rules.append(active_rule)
 
     result: dict[str, Any] = {
         "capabilities": ["proposal"],
-        "version": 0x20000000,
+        "version": version,
         "rules": rules,
-        "vbavailable": {},
+        "vbavailable": vbavailable,
         "vbrequired": 0,
         "previousblockhash": previous.block_hash[::-1].hex(),
         "transactions": transactions,
@@ -159,4 +184,6 @@ def create_block_template(
     if segwit_active:
         result["weightlimit"] = MAX_BLOCK_WEIGHT
         result["default_witness_commitment"] = _witness_commitment(_selected)
+    if signet_active:
+        result["signet_challenge"] = params.signet_challenge.hex()
     return result

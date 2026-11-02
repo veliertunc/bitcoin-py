@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from io import BytesIO
 from typing import BinaryIO
@@ -14,6 +15,9 @@ MAX_INV_ENTRIES = 50_000
 MAX_HEADERS = 2_000
 MAX_BLOCK_LOCATORS = 101
 MAX_ADDR_ENTRIES = 1_000
+ADDRV2_IPV4 = 1
+ADDRV2_IPV6 = 2
+MAX_ADDRV2_ADDRESS_LENGTH = 512
 
 
 def _read_exact(stream: BinaryIO, length: int) -> bytes:
@@ -60,6 +64,112 @@ def decode_addr(payload: bytes) -> tuple[TimestampedAddress, ...]:
     for _ in range(count):
         timestamp = int.from_bytes(_read_exact(stream, 4), "little")
         entries.append(TimestampedAddress(timestamp, NetworkAddress.deserialize(stream)))
+    _ensure_consumed(stream)
+    return tuple(entries)
+
+
+@dataclass(frozen=True, slots=True)
+class AddressV2Entry:
+    """BIP155 address record; unsupported network identifiers are preserved."""
+
+    timestamp: int
+    services: int
+    network_id: int
+    address: bytes
+    port: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.timestamp <= 0xFFFFFFFF:
+            raise ValueError("address timestamp must fit in uint32")
+        if not 0 <= self.services <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("address services must fit in uint64")
+        if not 0 <= self.network_id <= 0xFF:
+            raise ValueError("address network id must fit in uint8")
+        if len(self.address) > MAX_ADDRV2_ADDRESS_LENGTH:
+            raise ValueError("address-v2 address exceeds 512 bytes")
+        if not 0 <= self.port <= 0xFFFF:
+            raise ValueError("address port must fit in uint16")
+
+    def to_network_address(self) -> TimestampedAddress | None:
+        """Convert IPv4/IPv6 records to the address book's routable-IP form."""
+        if self.network_id == ADDRV2_IPV4 and len(self.address) == 4:
+            address = ipaddress.IPv4Address(self.address)
+        elif self.network_id == ADDRV2_IPV6 and len(self.address) == 16:
+            address = ipaddress.IPv6Address(self.address)
+        else:
+            return None
+        return TimestampedAddress(
+            self.timestamp,
+            NetworkAddress(self.services, address, self.port),
+        )
+
+
+def _write_varint(value: int) -> bytes:
+    """Encode Bitcoin Core's base-128 VARINT used for BIP155 services."""
+    if not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("VARINT must fit in uint64")
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            byte |= 0x80
+        encoded.append(byte)
+        if not value:
+            break
+        value -= 1
+    encoded.reverse()
+    return bytes(encoded)
+
+
+def _read_varint(stream: BytesIO) -> int:
+    value = 0
+    for _ in range(10):
+        byte = _read_exact(stream, 1)[0]
+        if value > (0xFFFFFFFFFFFFFFFF >> 7):
+            raise ValueError("address services VARINT overflows uint64")
+        value = (value << 7) | (byte & 0x7F)
+        if byte & 0x80:
+            if value == 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("address services VARINT overflows uint64")
+            value += 1
+            continue
+        return value
+    raise ValueError("address services VARINT is too long")
+
+
+def encode_addrv2(entries: tuple[AddressV2Entry, ...] | list[AddressV2Entry]) -> bytes:
+    """Serialize a BIP155 ``addrv2`` message."""
+    if len(entries) > MAX_ADDR_ENTRIES:
+        raise ValueError("addrv2 message exceeds 1,000 entries")
+    result = bytearray(write_compact_size(len(entries)))
+    for entry in entries:
+        result.extend(entry.timestamp.to_bytes(4, "little"))
+        result.extend(_write_varint(entry.services))
+        result.append(entry.network_id)
+        result.extend(write_compact_size(len(entry.address)))
+        result.extend(entry.address)
+        result.extend(entry.port.to_bytes(2, "big"))
+    return bytes(result)
+
+
+def decode_addrv2(payload: bytes) -> tuple[AddressV2Entry, ...]:
+    """Parse BIP155 records, retaining unknown network IDs for safe forwarding."""
+    stream = BytesIO(payload)
+    count = read_compact_size(stream)
+    if count > MAX_ADDR_ENTRIES:
+        raise ValueError("addrv2 message exceeds 1,000 entries")
+    entries = []
+    for _ in range(count):
+        timestamp = int.from_bytes(_read_exact(stream, 4), "little")
+        services = _read_varint(stream)
+        network_id = _read_exact(stream, 1)[0]
+        address_length = read_compact_size(stream)
+        if address_length > MAX_ADDRV2_ADDRESS_LENGTH:
+            raise ValueError("addrv2 address exceeds 512 bytes")
+        address = _read_exact(stream, address_length)
+        port = int.from_bytes(_read_exact(stream, 2), "big")
+        entries.append(AddressV2Entry(timestamp, services, network_id, address, port))
     _ensure_consumed(stream)
     return tuple(entries)
 

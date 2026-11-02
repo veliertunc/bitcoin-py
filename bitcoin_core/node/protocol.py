@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
+import hmac
+import secrets
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -21,11 +25,14 @@ from bitcoin_core.network.compact_filters import (
 )
 from bitcoin_core.crypto.hashes import hash256
 from bitcoin_core.network.messages import (
+    AddressV2Entry,
     GetBlocks,
     TimestampedAddress,
     decode_addr,
+    decode_addrv2,
     decode_inventory,
     encode_addr,
+    encode_addrv2,
     encode_headers,
     encode_inventory,
     InventoryVector,
@@ -53,10 +60,12 @@ class NodeProtocol:
     relay: MempoolRelay | None = None
     address_book: AddressBook | None = None
     pending_header_requests: dict[PeerConnection, bytes] = field(default_factory=dict)
+    addr_relay_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
 
     async def __call__(self, peer: PeerConnection, message: Message) -> None:
         if message.command == "verack":
             if peer.established:
+                peer.addr_relay_enabled = not peer.inbound
                 if self.address_book is not None and peer.address is not None and peer.handshake.remote_version:
                     try:
                         remote_ip = ipaddress.ip_address(peer.address[0])
@@ -71,7 +80,8 @@ class NodeProtocol:
                         pass
                 await self.headers.begin(peer)
                 await peer.send("sendheaders")
-                if self.address_book is not None:
+                if self.address_book is not None and not peer.inbound:
+                    peer.add_address_tokens(1_000)
                     await peer.send("getaddr")
                 if self.relay is not None and peer.handshake.remote_version:
                     if peer.handshake.remote_version.protocol_version >= 70_013:
@@ -102,13 +112,66 @@ class NodeProtocol:
                 await peer.close()
                 raise
             source = str(peer.address[0]) if peer.address else ""
-            self.address_book.add_many(addresses, source=source)
-        elif message.command == "getaddr" and self.address_book is not None:
-            entries = tuple(
-                TimestampedAddress(record.timestamp, record.address)
-                for record in self.address_book.recent()
+            peer.addr_relay_enabled = True
+            allowed = tuple(
+                entry for entry in addresses if peer.consume_address_token()
             )
-            await peer.send("addr", encode_addr(entries))
+            for entry in allowed:
+                peer.remember_address(self._address_key(entry))
+            peer.addr_processed += self.address_book.add_many(allowed, source=source)
+            if len(addresses) <= 10:
+                await self._relay_addresses(peer, allowed)
+        elif message.command == "addrv2" and self.address_book is not None:
+            try:
+                addresses_v2 = decode_addrv2(message.payload)
+            except ValueError:
+                await peer.close()
+                raise
+            source = str(peer.address[0]) if peer.address else ""
+            peer.addr_relay_enabled = True
+            allowed = tuple(
+                entry for entry in addresses_v2 if peer.consume_address_token()
+            )
+            for entry in allowed:
+                peer.remember_address(self._address_key(entry))
+            peer.addr_processed += self.address_book.add_many(allowed, source=source)
+            if len(addresses_v2) <= 10:
+                await self._relay_addresses(peer, allowed)
+        elif message.command == "getaddr":
+            if message.payload:
+                await peer.close()
+                raise ValueError("getaddr message must be empty")
+            if not peer.inbound or peer.getaddr_received:
+                return
+            peer.getaddr_received = True
+            peer.addr_relay_enabled = True
+            if self.address_book is None:
+                return
+            records = self.address_book.recent()
+            if peer.handshake.received_addrv2:
+                entries_v2 = []
+                for record in records:
+                    entries_v2.append(
+                        AddressV2Entry(
+                            record.timestamp,
+                            record.services,
+                            record.network_id,
+                            record.address_bytes,
+                            record.port,
+                        )
+                    )
+                await peer.send("addrv2", encode_addrv2(entries_v2))
+                for entry in entries_v2:
+                    peer.remember_address(self._address_key(entry))
+            else:
+                entries = tuple(
+                    TimestampedAddress(record.timestamp, record.address)
+                    for record in records
+                    if record.address is not None
+                )
+                await peer.send("addr", encode_addr(entries))
+                for entry in entries:
+                    peer.remember_address(self._address_key(entry))
         elif message.command == "getheaders":
             await peer.send("headers", self.headers.serve_getheaders(message.payload))
         elif message.command == "getblocks":
@@ -193,9 +256,112 @@ class NodeProtocol:
         elif message.command == "tx" and self.relay is not None:
             await self.relay.handle(peer, message, self.peers())
         elif message.command == "notfound":
+            if self.relay is not None:
+                await self.relay.handle(peer, message, self.peers())
             self.blocks.handle_notfound(peer, message.payload)
         elif message.command in ("getcfilters", "getcfheaders", "getcfcheckpt"):
             await self._serve_compact_filter_request(peer, message)
+
+    @staticmethod
+    def _address_v2(entry: AddressV2Entry | TimestampedAddress) -> AddressV2Entry | None:
+        if isinstance(entry, AddressV2Entry):
+            return entry
+        if isinstance(entry, TimestampedAddress):
+            address = entry.address.ip
+            network_id = (
+                1 if address.version == 4
+                else 6 if address.packed[0] == 0xFC
+                else 2
+            )
+            return AddressV2Entry(
+                entry.timestamp,
+                entry.address.services,
+                network_id,
+                address.packed,
+                entry.address.port,
+            )
+        return None
+
+    @classmethod
+    def _address_key(cls, entry: AddressV2Entry | TimestampedAddress) -> tuple[int, bytes, int]:
+        address = cls._address_v2(entry)
+        if address is None:
+            raise ValueError("unsupported address entry")
+        return address.network_id, address.address, address.port
+
+    async def _relay_addresses(
+        self,
+        source: PeerConnection,
+        entries: tuple[AddressV2Entry | TimestampedAddress, ...],
+    ) -> None:
+        """Relay fresh routable addresses to two stable, compatible peers."""
+        now = int(time.time())
+        rotation = now // (24 * 60 * 60)
+        candidates = [
+            peer
+            for peer in self.peers()
+            if peer is not source and peer.established and peer.addr_relay_enabled
+        ]
+        batches: dict[PeerConnection, list[AddressV2Entry]] = {}
+        for entry in entries:
+            address = self._address_v2(entry)
+            if (
+                address is None
+                or address.network_id not in (1, 2)
+                or address.timestamp <= now - 10 * 60
+                or address.timestamp > now + 10 * 60
+            ):
+                continue
+            if len(address.address) != (4 if address.network_id == 1 else 16):
+                continue
+            ip = ipaddress.ip_address(address.address)
+            if not ip.is_global:
+                continue
+            key = self._address_key(address)
+            eligible = [
+                peer
+                for peer in candidates
+                if key not in peer.known_addresses
+                and (peer.handshake.received_addrv2 or address.network_id in (1, 2))
+            ]
+            ranked = sorted(
+                eligible,
+                key=lambda peer: hmac.new(
+                    self.addr_relay_secret,
+                    rotation.to_bytes(8, "big")
+                    + address.network_id.to_bytes(1, "big")
+                    + address.address
+                    + address.port.to_bytes(2, "big")
+                    + int(peer.peer_id or 0).to_bytes(8, "big"),
+                    hashlib.sha256,
+                ).digest(),
+                reverse=True,
+            )
+            for peer in ranked[:2]:
+                peer.remember_address(key)
+                batches.setdefault(peer, []).append(address)
+
+        for peer, batch in batches.items():
+            try:
+                if peer.handshake.received_addrv2:
+                    await peer.send("addrv2", encode_addrv2(batch))
+                else:
+                    legacy = [
+                        TimestampedAddress(
+                            entry.timestamp,
+                            NetworkAddress(
+                                entry.services,
+                                ipaddress.ip_address(entry.address),
+                                entry.port,
+                            ),
+                        )
+                        for entry in batch
+                        if entry.network_id in (1, 2)
+                    ]
+                    if legacy:
+                        await peer.send("addr", encode_addr(legacy))
+            except (ConnectionError, OSError):
+                continue
 
     async def _serve_compact_filter_request(self, peer: PeerConnection, message: Message) -> None:
         store = self.blocks.store

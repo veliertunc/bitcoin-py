@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from bitcoin_core.consensus.params import ConsensusParams, MAINNET, REGTEST
+from bitcoin_core.consensus.versionbits import Deployment, NEVER_ACTIVE
 from bitcoin_core.primitives.block import Block, BlockHeader
 from bitcoin_core.primitives.transaction import OutPoint, Transaction, TxInput, TxOutput
 from bitcoin_core.script.interpreter import encode_script_num
@@ -87,6 +88,7 @@ TESTNET3 = ConsensusParams(
     script_flag_exceptions=(
         (bytes.fromhex("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105")[::-1], 0),
     ),
+    versionbits_deployments=(("testdummy", Deployment(28, NEVER_ACTIVE, NEVER_ACTIVE, threshold=1512)),),
 )
 TESTNET4_CONSENSUS = ConsensusParams(
     pow_limit=_MAINNET_LIMIT,
@@ -98,6 +100,7 @@ TESTNET4_CONSENSUS = ConsensusParams(
     bip65_height=1,
     csv_height=1,
     segwit_height=1,
+    versionbits_deployments=(("testdummy", Deployment(28, NEVER_ACTIVE, NEVER_ACTIVE, threshold=1512)),),
 )
 SIGNET = ConsensusParams(
     pow_limit=int("00000377ae000000000000000000000000000000000000000000000000000000", 16),
@@ -111,6 +114,7 @@ SIGNET = ConsensusParams(
     bip65_height=1,
     csv_height=1,
     segwit_height=1,
+    versionbits_deployments=(("testdummy", Deployment(28, NEVER_ACTIVE, NEVER_ACTIVE)),),
 )
 
 MAIN = ChainParams(

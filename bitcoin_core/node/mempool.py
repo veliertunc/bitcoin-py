@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
 
@@ -67,6 +68,8 @@ class Mempool:
     total_vbytes: int = 0
     sequence: int = 1
     transactions_updated: int = 1
+    transaction_added: Callable[[MempoolEntry], None] | None = field(default=None, repr=False)
+    transaction_removed: Callable[[bytes], None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_vbytes < 0 or self.min_relay_fee_per_kvb < 0:
@@ -251,6 +254,8 @@ class Mempool:
         self._trim_to_size()
         if txid not in self.entries:
             raise MempoolError("transaction evicted by mempool size limit")
+        if self.transaction_added is not None:
+            self.transaction_added(self.entries[txid])
         return entry
 
     def remove(self, txid: bytes, *, recursive: bool = True) -> tuple[bytes, ...]:
@@ -271,6 +276,8 @@ class Mempool:
             entry = self.entries.pop(current, None)
             if entry is None:
                 continue
+            if self.transaction_removed is not None:
+                self.transaction_removed(current)
             self.sequence += 1
             self.transactions_updated += 1
             self.unbroadcast_txs.discard(current)
@@ -338,6 +345,9 @@ class Mempool:
         """Remove all mempool entries and dependency indexes."""
         self.sequence += len(self.entries)
         self.transactions_updated += len(self.entries)
+        if self.transaction_removed is not None:
+            for txid in tuple(self.entries):
+                self.transaction_removed(txid)
         self.entries.clear()
         self.spent_outpoints.clear()
         self.unbroadcast_txs.clear()

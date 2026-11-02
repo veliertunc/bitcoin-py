@@ -14,12 +14,16 @@ from pathlib import Path
 
 from bitcoin_core.consensus.chainstate import CoinsView
 from bitcoin_core.network.addrman import AddressBook
+from bitcoin_core.network.banman import BanManager
 from bitcoin_core.network.connection import PeerConnection, PeerManager
+from bitcoin_core.network.endpoint import NodeEndpoint, parse_node_endpoint
 from bitcoin_core.network.messages import InventoryVector, encode_inventory
 from bitcoin_core.network.version import NODE_COMPACT_FILTERS, NODE_NETWORK, NetworkAddress, VersionMessage
 from bitcoin_core.node.block_sync import BlockSynchronizer
 from bitcoin_core.node.chain import HeaderChain
 from bitcoin_core.node.chainparams import ChainParams, get_chain_params
+from bitcoin_core.node.fee_estimator import MempoolFeeEstimator
+from bitcoin_core.node.block_policy_estimator import BlockPolicyEstimator
 from bitcoin_core.node.mempool import Mempool, MempoolError
 from bitcoin_core.node.mempool_persistence import (
     MempoolLoadResult,
@@ -35,6 +39,7 @@ from bitcoin_core.primitives.block import Block
 from bitcoin_core.script.validation import ConsensusScriptVerifier
 
 _LOGGER = logging.getLogger(__name__)
+MAX_ADDED_NODE_CONNECTIONS = 8
 
 
 @dataclass(slots=True)
@@ -51,6 +56,8 @@ class BitcoinNode:
     headers: HeaderChain = field(init=False)
     coins: CoinsView = field(init=False)
     mempool: Mempool = field(init=False)
+    fee_estimator: MempoolFeeEstimator = field(init=False)
+    block_policy_estimator: BlockPolicyEstimator = field(init=False)
     mempool_load_result: MempoolLoadResult = field(init=False)
     relay: MempoolRelay = field(init=False)
     header_sync: HeaderSynchronizer = field(init=False)
@@ -59,13 +66,18 @@ class BitcoinNode:
     rpc_server: RPCServer = field(init=False)
     input_verifier: ConsensusScriptVerifier = field(init=False)
     address_book: AddressBook = field(init=False)
+    ban_manager: BanManager = field(init=False)
     _manager: PeerManager | None = field(init=False, default=None)
     _peers: Callable[[], list] = field(init=False)
+    _added_nodes: dict[tuple[str, int], tuple[str, NodeEndpoint]] = field(init=False, default_factory=dict)
+    _added_connecting: set[tuple[str, int]] = field(init=False, default_factory=set)
+    _added_tasks: set[asyncio.Task] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = SQLiteNodeStore(self.data_dir / "chainstate.sqlite")
         self.address_book = AddressBook(self.data_dir / "peers.sqlite")
+        self.ban_manager = BanManager(self.data_dir / "banlist.sqlite")
         self.headers = HeaderChain(self.params.consensus)
         self.input_verifier = ConsensusScriptVerifier(self.params.consensus)
         if self.store.best_block() is None:
@@ -98,6 +110,15 @@ class BitcoinNode:
         )
         if self.mempool_load_result.reason is not None:
             _LOGGER.warning("Mempool snapshot was ignored: %s", self.mempool_load_result.reason)
+        self.fee_estimator = MempoolFeeEstimator(self.data_dir / "fee-estimator.sqlite", self.mempool)
+        self.block_policy_estimator = BlockPolicyEstimator(
+            self.data_dir / "fee-estimates.sqlite"
+        )
+        self.block_policy_estimator.best_height = self.store.best_height()
+        self.mempool.transaction_added = lambda entry: self.block_policy_estimator.process_transaction(
+            entry, self.store.best_height()
+        )
+        self.mempool.transaction_removed = self.block_policy_estimator.remove_transaction
         self._peers = lambda: list(self._manager.peers) if self._manager else []
         self.relay = MempoolRelay(
             self.mempool,
@@ -131,6 +152,7 @@ class BitcoinNode:
             magic=self.params.message_start,
             message_handler=self.protocol,
             disconnect_handler=self._peer_disconnected,
+            address_filter=self._peer_address_allowed,
         )
         rpc = NodeRPC(
             self.store,
@@ -145,6 +167,18 @@ class BitcoinNode:
             self.block_sync.test_block,
             self._dump_mempool,
             self._import_mempool,
+            self._network_totals,
+            self.address_book,
+            self._network_active,
+            self._set_network_active,
+            self._disconnect_peer,
+            self._manage_added_node,
+            self._added_node_info,
+            self.ban_manager,
+            self._disconnect_banned,
+            self._peer_inflight_blocks,
+            fee_estimator=self.fee_estimator,
+            block_policy_estimator=self.block_policy_estimator,
         )
         self.rpc_server = RPCServer(
             rpc,
@@ -172,6 +206,179 @@ class BitcoinNode:
             relay=True,
         )
 
+    def _network_totals(self) -> tuple[int, int]:
+        """Return traffic totals from peer connections that have already closed."""
+        if self._manager is None:
+            return 0, 0
+        return self._manager.bytes_sent_total, self._manager.bytes_received_total
+
+    def _peer_inflight_blocks(self, peer: PeerConnection) -> list[int]:
+        return sorted(
+            index.height
+            for block_hash, owner in self.block_sync.in_flight.items()
+            if owner is peer
+            and (index := self.headers.indexes.get(block_hash)) is not None
+        )
+
+    def _network_active(self) -> bool:
+        return self._manager.network_active if self._manager is not None else False
+
+    def _set_network_active(self, active: bool) -> bool:
+        if self._manager is None:
+            return False
+        return self._manager.set_network_active(active)
+
+    def _peer_address_allowed(self, remote: tuple | None) -> bool:
+        if remote is None:
+            return True
+        try:
+            return not self.ban_manager.is_banned(remote[0])
+        except (IndexError, TypeError):
+            return True
+
+    async def _disconnect_banned(self, subnet) -> None:
+        for peer in tuple(self._peers()):
+            remote = peer.address
+            if remote is None:
+                continue
+            try:
+                ip = ipaddress.ip_address(remote[0])
+            except ValueError:
+                continue
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                ip = ip.ipv4_mapped
+            if ip.version == subnet.version and ip in subnet:
+                await peer.close()
+
+    @staticmethod
+    def _added_node_key(endpoint: NodeEndpoint) -> tuple[str, int]:
+        return endpoint.host.lower(), endpoint.port
+
+    def _schedule_added_connection(self, endpoint: NodeEndpoint) -> None:
+        if self._manager is None or not self._manager.network_active:
+            return
+        key = self._added_node_key(endpoint)
+        if key in self._added_connecting or any(
+            peer.destination is not None
+            and (peer.destination[0].lower(), peer.destination[1]) == key
+            for peer in self._manager.peers
+        ):
+            return
+        active_added = sum(
+            1
+            for peer in self._manager.peers
+            if peer.destination is not None
+            and (peer.destination[0].lower(), peer.destination[1]) in self._added_nodes
+        )
+        if active_added + len(self._added_connecting) >= MAX_ADDED_NODE_CONNECTIONS:
+            return
+        self._added_connecting.add(key)
+        task = asyncio.create_task(self._connect_added_node(endpoint))
+        self._added_tasks.add(task)
+        task.add_done_callback(lambda completed: self._finish_added_task(completed, key))
+
+    def _finish_added_task(self, task: asyncio.Task, key: tuple[str, int]) -> None:
+        self._added_tasks.discard(task)
+        self._added_connecting.discard(key)
+
+    async def _connect_added_node(self, endpoint: NodeEndpoint) -> None:
+        if self._manager is None or not self._manager.network_active:
+            return
+        try:
+            await self._manager.connect(
+                endpoint.host,
+                endpoint.port,
+                connection_type="manual",
+            )
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            return
+
+    async def _manage_added_node(self, specification: str, command: str) -> None:
+        if command not in {"add", "remove", "onetry"}:
+            raise ValueError("command must be add, remove, or onetry")
+        try:
+            endpoint = parse_node_endpoint(specification, self.params.default_port)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        key = self._added_node_key(endpoint)
+        if command == "add":
+            if key in self._added_nodes:
+                raise ValueError("Node already added")
+            self._added_nodes[key] = (specification, endpoint)
+            self._schedule_added_connection(endpoint)
+        elif command == "remove":
+            if key not in self._added_nodes:
+                raise ValueError("Node has not been added")
+            del self._added_nodes[key]
+        else:
+            self._schedule_added_connection(endpoint)
+
+    def _added_node_info(self, specification: str | None = None) -> list[dict]:
+        entries = self._added_nodes.values()
+        if specification is not None:
+            try:
+                endpoint = parse_node_endpoint(specification, self.params.default_port)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            entry = self._added_nodes.get(self._added_node_key(endpoint))
+            if entry is None:
+                raise ValueError("Node has not been added")
+            entries = (entry,)
+        result = []
+        for original, endpoint in entries:
+            key = self._added_node_key(endpoint)
+            connected = []
+            for peer in self._peers():
+                destination = peer.destination
+                if destination is None or (destination[0].lower(), destination[1]) != key:
+                    continue
+                remote = peer.address
+                host, port = (str(remote[0]), remote[1]) if remote else destination
+                connected.append({"address": f"{host}:{port}", "connected": "outbound"})
+            item = {"addednode": original, "connected": bool(connected)}
+            if connected:
+                item["addresses"] = connected
+            result.append(item)
+        return result
+
+    async def _disconnect_peer(self, address: str | None, peer_id: int | None) -> bool:
+        if self._manager is None:
+            return False
+        host_filter: str | None = None
+        port_filter: int | None = None
+        if address is not None:
+            candidate = address
+            if candidate.startswith("[") and "]" in candidate:
+                close = candidate.index("]")
+                host_filter = candidate[1:close]
+                suffix = candidate[close + 1 :]
+                if suffix:
+                    if not suffix.startswith(":") or not suffix[1:].isdecimal():
+                        return False
+                    port_filter = int(suffix[1:])
+            else:
+                try:
+                    host_filter = str(ipaddress.ip_address(candidate))
+                except ValueError:
+                    host, separator, port_text = candidate.rpartition(":")
+                    if separator and port_text.isdecimal():
+                        host_filter = host
+                        port_filter = int(port_text)
+                    else:
+                        host_filter = candidate
+        for peer in tuple(self._manager.peers):
+            if peer_id is not None and peer.peer_id != peer_id:
+                continue
+            if host_filter is not None:
+                remote = peer.address
+                if remote is None or str(remote[0]).lower() != host_filter.lower():
+                    continue
+                if port_filter is not None and remote[1] != port_filter:
+                    continue
+            await peer.close()
+            return True
+        return False
+
     async def _submit_block(self, block: Block) -> str | None:
         """Submit a mined block through the same chain activation path as P2P blocks."""
         status = await self.block_sync.accept_local_block(block)
@@ -198,6 +405,51 @@ class BitcoinNode:
             for block in connected
             for transaction in block.transactions
         )
+        pending_mempool_ids = set(self.mempool.entries)
+
+        def discard_mempool_descendants(txid: bytes) -> None:
+            stack = [txid]
+            while stack:
+                current = stack.pop()
+                if current not in pending_mempool_ids:
+                    continue
+                pending_mempool_ids.discard(current)
+                entry = self.mempool.entries.get(current)
+                if entry is not None:
+                    stack.extend(entry.children)
+
+        for block in connected:
+            index = self.headers.indexes.get(block.header.block_hash)
+            if index is None:
+                continue
+            block_weight = 0
+            removed_weight = 0
+            block_txids = {transaction.txid for transaction in block.transactions}
+            for transaction in block.transactions[1:]:
+                for txin in transaction.inputs:
+                    conflicting = self.mempool.spent_outpoints.get(
+                        (txin.previous_output.txid, txin.previous_output.index)
+                    )
+                    if conflicting is not None and conflicting not in block_txids:
+                        discard_mempool_descendants(conflicting)
+                raw = transaction.serialize(include_witness=True)
+                stripped = transaction.serialize(include_witness=False)
+                weight = len(stripped) * 3 + len(raw)
+                block_weight += weight
+                if transaction.txid in pending_mempool_ids:
+                    removed_weight += weight
+                    pending_mempool_ids.discard(transaction.txid)
+            self.fee_estimator.record_block(
+                index.height,
+                index.block_hash,
+                block.header.previous_block,
+                block_weight,
+                removed_weight,
+            )
+            self.block_policy_estimator.process_block(
+                index.height,
+                tuple(transaction.txid for transaction in block.transactions[1:]),
+            )
         self.mempool.remove_for_block(connected_transactions)
         self.mempool.revalidate(
             self.coins,
@@ -213,9 +465,21 @@ class BitcoinNode:
                     await self.relay.submit(transaction, self._peers())
                 except MempoolError:
                     continue
+        await self.relay.rebroadcast_unbroadcast(self._peers())
 
     def _peer_disconnected(self, peer: PeerConnection) -> None:
         """Release all per-peer synchronization state when a socket closes."""
+        # Addrman success means the peer completed the protocol handshake. A
+        # TCP connection that never reaches that point must keep its failure
+        # penalty so it is not repeatedly selected ahead of healthier peers.
+        if peer.ever_established and peer.address is not None:
+            try:
+                remote_ip = ipaddress.ip_address(peer.address[0])
+                self.address_book.mark_success(
+                    NetworkAddress(0, remote_ip, peer.address[1])
+                )
+            except ValueError:
+                pass
         self.block_sync.peer_disconnected(peer)
         self.protocol.pending_header_requests.pop(peer, None)
         self.relay.orphanage.remove_peer(peer)
@@ -257,6 +521,10 @@ class BitcoinNode:
                 await asyncio.gather(maintenance, return_exceptions=True)
         finally:
             await self.rpc_server.close()
+            for task in tuple(self._added_tasks):
+                task.cancel()
+            if self._added_tasks:
+                await asyncio.gather(*tuple(self._added_tasks), return_exceptions=True)
             await self._manager.close()
             try:
                 dump_mempool(self.data_dir / "mempool.dat", self.params.message_start, self.mempool)
@@ -264,6 +532,9 @@ class BitcoinNode:
                 _LOGGER.exception("Unable to persist the mempool")
             finally:
                 self.address_book.close()
+                self.ban_manager.close()
+                self.fee_estimator.close()
+                self.block_policy_estimator.close()
                 self.store.close()
 
     async def _connect_seed(self, seed: str, port: int) -> None:
@@ -273,13 +544,21 @@ class BitcoinNode:
                 ip = ipaddress.ip_address(peer.address[0])
                 address = NetworkAddress(1, ip, peer.address[1])
                 self.address_book.add(address, source=seed)
-                self.address_book.mark_attempt(address)
+                # The socket is live; the disconnect callback records the
+                # protocol-level success after the handshake completes.
         except (OSError, asyncio.TimeoutError):
             return
 
     async def _maintain_peers(self) -> None:
         while True:
+            self.block_policy_estimator.flush()
             self.address_book.prune()
+            self.ban_manager.prune()
+            if not self._manager.network_active:
+                await asyncio.sleep(30)
+                continue
+            for _, endpoint in self._added_nodes.values():
+                self._schedule_added_connection(endpoint)
             outbound = [peer for peer in self._manager.peers if not peer.inbound]
             target = max(0, 8 - len(outbound))
             if target:
