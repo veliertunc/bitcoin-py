@@ -77,16 +77,7 @@ class BlockSynchronizer:
             except ValueError:
                 await peer.close()
                 raise
-            missing = []
-            for item in inventory:
-                if item.type & 0x3FFFFFFF != 2:
-                    missing.append(item)
-                    continue
-                block = self.store.load_block(item.hash)
-                if block is None:
-                    missing.append(item)
-                else:
-                    await peer.send("block", block.serialize())
+            missing = await self.serve_inventory(peer, inventory)
             if missing:
                 await peer.send("notfound", encode_inventory(missing))
             return True
@@ -112,6 +103,20 @@ class BlockSynchronizer:
         await self._activate_if_ready()
         await self.request_more(peers)
         return True
+
+    async def serve_inventory(self, peer: PeerConnection, inventory) -> list[InventoryVector]:
+        """Serve known blocks and return unresolved inventory entries."""
+        missing = []
+        for item in inventory:
+            if item.type & 0x3FFFFFFF != 2:
+                missing.append(item)
+                continue
+            block = self.store.load_block(item.hash)
+            if block is None:
+                missing.append(item)
+            else:
+                await peer.send("block", block.serialize())
+        return missing
 
     def handle_notfound(self, peer: PeerConnection, payload: bytes) -> tuple[bytes, ...]:
         """Release block requests the peer reports it cannot fulfill."""

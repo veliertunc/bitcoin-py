@@ -5,6 +5,8 @@ from .sync import HeaderSynchronizer, block_locator
 from .storage import SQLiteNodeStore
 from .block_sync import BlockSynchronizer
 from .protocol import NodeProtocol
+from .mempool import Mempool, MempoolEntry, MempoolError
+from .relay import MempoolRelay
 
 __all__ = [
     "BlockIndex",
@@ -13,6 +15,10 @@ __all__ = [
     "HeaderSynchronizer",
     "HeaderValidationError",
     "NodeProtocol",
+    "Mempool",
+    "MempoolEntry",
+    "MempoolError",
+    "MempoolRelay",
     "SQLiteNodeStore",
     "block_locator",
     "expected_work_bits",
