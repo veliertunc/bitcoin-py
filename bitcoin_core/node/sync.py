@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from bitcoin_core.network.connection import PeerConnection
-from bitcoin_core.network.messages import MAX_HEADERS, GetHeaders, decode_headers
+from bitcoin_core.network.messages import MAX_HEADERS, GetHeaders, decode_headers, encode_headers
 from bitcoin_core.network.protocol import MAINNET_MAGIC, Message, encode_message
 from bitcoin_core.node.chain import HeaderChain, HeaderValidationError
 
@@ -46,6 +46,32 @@ class HeaderSynchronizer:
     async def begin(self, peer: PeerConnection) -> None:
         """Request headers from one established peer."""
         await peer.send("getheaders", GetHeaders(self.protocol_version, block_locator(self.chain)).serialize())
+
+    def serve_getheaders(self, payload: bytes) -> bytes:
+        """Build an encoded headers response for a peer's locator request."""
+        request = GetHeaders.deserialize(payload)
+        tip = self.chain.tip
+        if tip is None:
+            headers = ()
+        else:
+            start_height = -1
+            for block_hash in request.locators:
+                candidate = self.chain.indexes.get(block_hash)
+                if candidate is not None:
+                    active_candidate = tip.ancestor(candidate.height)
+                    if active_candidate is candidate:
+                        start_height = candidate.height
+                        break
+            result = []
+            for height in range(start_height + 1, tip.height + 1):
+                index = tip.ancestor(height)
+                if index is None:
+                    break
+                result.append(index.header)
+                if index.block_hash == request.stop_hash or len(result) >= MAX_HEADERS:
+                    break
+            headers = tuple(result)
+        return encode_headers(headers)
 
     async def handle(self, peer: PeerConnection, message: Message) -> int:
         """Validate a headers response and continue if it filled a full batch."""

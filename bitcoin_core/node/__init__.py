@@ -4,6 +4,7 @@ from .chain import BlockIndex, HeaderChain, HeaderValidationError, expected_work
 from .sync import HeaderSynchronizer, block_locator
 from .storage import SQLiteNodeStore
 from .block_sync import BlockSynchronizer
+from .protocol import NodeProtocol
 
 __all__ = [
     "BlockIndex",
@@ -11,6 +12,7 @@ __all__ = [
     "HeaderChain",
     "HeaderSynchronizer",
     "HeaderValidationError",
+    "NodeProtocol",
     "SQLiteNodeStore",
     "block_locator",
     "expected_work_bits",
