@@ -218,6 +218,7 @@ class BitcoinNode:
         """Release all per-peer synchronization state when a socket closes."""
         self.block_sync.peer_disconnected(peer)
         self.protocol.pending_header_requests.pop(peer, None)
+        self.relay.orphanage.remove_peer(peer)
 
     def _dump_mempool(self) -> str:
         """Persist the current transaction pool and return its file path."""

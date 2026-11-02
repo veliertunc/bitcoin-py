@@ -40,6 +40,7 @@ from bitcoin_core.node.sync import HeaderSynchronizer
 
 MAX_GETBLOCKS_RESULTS = 500
 MSG_BLOCK = 2
+MAX_HEADERS_ANNOUNCEMENT = 8
 
 
 @dataclass(slots=True)
@@ -307,12 +308,18 @@ class NodeProtocol:
                     except MempoolError:
                         continue
 
+        announced_headers = []
+        cursor = new_index
+        while cursor is not None and len(announced_headers) < MAX_HEADERS_ANNOUNCEMENT:
+            announced_headers.append(cursor.header)
+            cursor = cursor.previous
+        announced_headers.reverse()
         for candidate in self.peers():
             if not candidate.established or candidate is source:
                 continue
             try:
                 if candidate.prefers_headers:
-                    await candidate.send("headers", encode_headers((new_index.header,)))
+                    await candidate.send("headers", encode_headers(announced_headers))
                 else:
                     await candidate.send("inv", encode_inventory([InventoryVector(2, new_hash)]))
             except (ConnectionError, OSError):

@@ -54,14 +54,23 @@ class MempoolRelay:
         *,
         exclude: PeerConnection | None = None,
     ) -> None:
-        inventory = encode_inventory([InventoryVector(MSG_TX, entry.txid)])
         for candidate in peers:
+            wtxid_relay = (
+                candidate.handshake.sent_wtxidrelay
+                and candidate.handshake.received_wtxidrelay
+            )
             if (
                 candidate is not exclude
                 and candidate.established
                 and entry.fee * 1_000 >= candidate.fee_filter * entry.vsize
             ):
                 try:
+                    inventory = encode_inventory([
+                        InventoryVector(
+                            MSG_WTX if wtxid_relay else MSG_TX,
+                            entry.wtxid if wtxid_relay else entry.txid,
+                        )
+                    ])
                     await candidate.send("inv", inventory)
                 except (ConnectionError, OSError):
                     continue
@@ -174,8 +183,15 @@ class MempoolRelay:
 
     async def serve_mempool(self, peer: PeerConnection) -> int:
         """Answer a BIP35 mempool request with fee-filtered transaction inventory."""
+        wtxid_relay = (
+            peer.handshake.sent_wtxidrelay
+            and peer.handshake.received_wtxidrelay
+        )
         inventory = [
-            InventoryVector(MSG_TX, entry.txid)
+            InventoryVector(
+                MSG_WTX if wtxid_relay else MSG_TX,
+                entry.wtxid if wtxid_relay else entry.txid,
+            )
             for entry in self.mempool.entries.values()
             if entry.fee * 1_000 >= peer.fee_filter * entry.vsize
         ]

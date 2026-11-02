@@ -253,6 +253,9 @@ class BlockSynchronizer:
             for index in reversed(old_branch)
             if (block := self.store.load_block(index.block_hash)) is not None
         )
+        if self.activation_handler is not None and len(disconnected) != len(old_branch):
+            self.last_rejection = "active branch block data is unavailable for mempool reconciliation"
+            return False
         blocks = []
         for index in new_branch:
             pending = self.pending.get(index.block_hash)

@@ -564,8 +564,6 @@ class NodeRPC:
         hash_or_height: Any = None,
         use_index: Any = True,
     ) -> dict[str, Any]:
-        if hash_or_height is not None:
-            raise RPCError(-8, "Querying specific block heights requires coinstatsindex")
         if not isinstance(hash_type, str) or hash_type not in ("hash_serialized_3", "muhash", "none"):
             raise RPCError(-8, f"'{hash_type}' is not a valid hash_type")
         if not isinstance(use_index, bool):
@@ -573,8 +571,46 @@ class NodeRPC:
         best_hash = self.store.best_block()
         if best_hash is None:
             raise RPCError(-32603, "Active chain is unavailable")
+
+        height = self.store.best_height()
+        block_hash = best_hash
+        view = self.coins
+        if hash_or_height is not None:
+            if isinstance(hash_or_height, bool):
+                raise RPCError(-8, "hash_or_height must be a block height or hash")
+            if isinstance(hash_or_height, int):
+                if hash_or_height < 0:
+                    raise RPCError(-8, "Block height must be non-negative")
+                height = hash_or_height
+                block_hash = self.store.active_block_hash(height)
+                if block_hash is None:
+                    raise RPCError(-8, "Block height is outside the active chain")
+            elif isinstance(hash_or_height, str):
+                block_hash = self._parse_hash(hash_or_height)
+                header_height = self.store.header_height(block_hash)
+                if header_height is None:
+                    raise RPCError(-5, "Block not found")
+                height = header_height
+                if self.store.active_block_hash(height) != block_hash:
+                    raise RPCError(-8, "Block is not in the active chain")
+            else:
+                raise RPCError(-8, "hash_or_height must be a block height or hash")
+
+        if height != self.store.best_height():
+            view = CoinsView(self.coins.coins.copy())
+            for disconnect_height in range(self.store.best_height(), height, -1):
+                active_hash = self.store.active_block_hash(disconnect_height)
+                undo = self.store.load_undo(active_hash) if active_hash is not None else None
+                if undo is None:
+                    raise RPCError(-8, f"Undo data is unavailable at height {disconnect_height}")
+                for outpoint in reversed(undo.created):
+                    view.coins.pop(outpoint, None)
+                for outpoint, coin in undo.spent:
+                    if outpoint in view.coins:
+                        raise RPCError(-32603, "Undo data conflicts with the reconstructed UTXO set")
+                    view.coins[outpoint] = coin
         try:
-            return calculate_utxo_stats(self.store, best_hash, self.store.best_height(), hash_type)
+            return calculate_utxo_stats(self.store, block_hash, height, hash_type, coins=view)
         except (OSError, ValueError) as exc:
             raise RPCError(-32603, f"Unable to compute UTXO statistics: {exc}") from exc
 
@@ -967,6 +1003,10 @@ class NodeRPC:
             "minfeefilter": peer.fee_filter / 100_000_000,
             "connection_type": "inbound" if peer.inbound else "outbound-full-relay",
             "transport_protocol_type": "v1",
+            "wtxidrelay": (
+                peer.handshake.sent_wtxidrelay
+                and peer.handshake.received_wtxidrelay
+            ),
         }
         if peer.ping_time is not None:
             result["pingtime"] = peer.ping_time

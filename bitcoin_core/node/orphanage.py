@@ -11,6 +11,7 @@ from bitcoin_core.primitives.transaction import Transaction
 MAX_ORPHAN_TRANSACTION_SIZE = 100_000
 MAX_ORPHANAGE_BYTES = 20_000_000
 ORPHAN_EXPIRY_SECONDS = 20 * 60
+MAX_ORPHANS_PER_PEER = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,9 +35,15 @@ class Orphanage:
 
     max_bytes: int = MAX_ORPHANAGE_BYTES
     expiry_seconds: int = ORPHAN_EXPIRY_SECONDS
+    max_per_peer: int = MAX_ORPHANS_PER_PEER
     entries: dict[bytes, OrphanTransaction] = field(default_factory=dict)
     by_parent: dict[bytes, set[bytes]] = field(default_factory=dict)
+    by_peer: dict[PeerConnection, set[bytes]] = field(default_factory=dict)
     total_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_bytes < 0 or self.expiry_seconds < 0 or self.max_per_peer < 0:
+            raise ValueError("orphanage limits cannot be negative")
 
     def add(
         self,
@@ -57,9 +64,19 @@ class Orphanage:
             or any(len(parent) != 32 for parent in parents)
             or size > MAX_ORPHAN_TRANSACTION_SIZE
             or size > self.max_bytes
+            or (peer is not None and self.max_per_peer == 0)
         ):
             return False
         added_at = int(time.time()) if now is None else now
+        if peer is not None:
+            peer_orphans = self.by_peer.get(peer, set())
+            while len(peer_orphans) >= self.max_per_peer:
+                oldest_peer_orphan = min(
+                    (self.entries[item] for item in peer_orphans),
+                    key=lambda item: (item.added_at, item.txid),
+                )
+                self.remove(oldest_peer_orphan.txid)
+                peer_orphans = self.by_peer.get(peer, set())
         while self.total_bytes + size > self.max_bytes and self.entries:
             oldest = min(self.entries.values(), key=lambda item: (item.added_at, item.txid))
             self.remove(oldest.txid)
@@ -68,6 +85,8 @@ class Orphanage:
         self.total_bytes += size
         for parent in parents:
             self.by_parent.setdefault(parent, set()).add(txid)
+        if peer is not None:
+            self.by_peer.setdefault(peer, set()).add(txid)
         return True
 
     def remove(self, txid: bytes) -> OrphanTransaction | None:
@@ -83,7 +102,20 @@ class Orphanage:
             children.discard(txid)
             if not children:
                 self.by_parent.pop(parent, None)
+        if entry.peer is not None:
+            peer_orphans = self.by_peer.get(entry.peer)
+            if peer_orphans is not None:
+                peer_orphans.discard(txid)
+                if not peer_orphans:
+                    self.by_peer.pop(entry.peer, None)
         return entry
+
+    def remove_peer(self, peer: PeerConnection) -> tuple[bytes, ...]:
+        """Discard orphans from a disconnected peer and release its reference."""
+        txids = tuple(sorted(self.by_peer.get(peer, ())))
+        for txid in txids:
+            self.remove(txid)
+        return txids
 
     def children_of(self, parent_txid: bytes) -> tuple[bytes, ...]:
         """Return waiting txids that reference a newly available parent."""

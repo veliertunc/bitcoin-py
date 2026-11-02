@@ -82,6 +82,9 @@ class PeerConnection:
         """Send version, process incoming frames, and close when the stream ends."""
         try:
             await self._write(self.handshake.start(self.local_version))
+            if self.local_version.protocol_version >= 70_016:
+                await self._write(encode_message("wtxidrelay", b"", self.magic))
+                self.handshake.sent_wtxidrelay = True
             self._handshake_started_at = time.monotonic()
             while not self._closed:
                 timeout = None

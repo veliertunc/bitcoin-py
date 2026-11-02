@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from bitcoin_core.crypto.muhash import MuHash3072
+from bitcoin_core.consensus.chainstate import CoinsView
 from bitcoin_core.node.storage import SQLiteNodeStore
 from bitcoin_core.serialization.compact_size import write_compact_size
 
@@ -62,15 +63,33 @@ def _write_varint(value: int) -> bytes:
     return bytes(encoded)
 
 
-def calculate_utxo_stats(store: SQLiteNodeStore, block_hash: bytes, height: int, hash_type: str) -> dict[str, Any]:
+def calculate_utxo_stats(
+    store: SQLiteNodeStore,
+    block_hash: bytes,
+    height: int,
+    hash_type: str,
+    *,
+    coins: CoinsView | None = None,
+) -> dict[str, Any]:
     """Compute Core-compatible UTXO counts, totals, and the selected commitment."""
     if hash_type not in {"hash_serialized_3", "muhash", "none"}:
         raise ValueError("unknown UTXO hash type")
-    output_count, transaction_count, total_amount = store.utxo_summary()
+    if coins is None:
+        output_count, transaction_count, total_amount = store.utxo_summary()
+        entries = store.iter_coins()
+    else:
+        output_count = len(coins.coins)
+        transaction_count = len({txid for txid, _index in coins.coins})
+        total_amount = sum(coin.value for coin in coins.coins.values())
+        entries = (
+            iter(sorted(coins.coins.items()))
+            if hash_type == "hash_serialized_3"
+            else coins.coins.items()
+        )
     bogosize = 0
     legacy_digest = hashlib.sha256() if hash_type == "hash_serialized_3" else None
     muhash = MuHash3072() if hash_type == "muhash" else None
-    for outpoint, coin in store.iter_coins():
+    for outpoint, coin in entries:
         bogosize += 32 + 4 + 4 + 8 + 2 + len(coin.script_pubkey)
         if legacy_digest is not None:
             legacy_digest.update(serialize_utxo_entry(outpoint, coin))
