@@ -10,6 +10,7 @@ from bitcoin_core.network.connection import PeerConnection
 from bitcoin_core.network.messages import InventoryVector, decode_inventory, encode_inventory
 from bitcoin_core.network.protocol import Message
 from bitcoin_core.node.mempool import MSG_TX, MSG_WTX, Mempool, MempoolError
+from bitcoin_core.node.mempool import MempoolEntry
 from bitcoin_core.primitives.transaction import Transaction
 
 
@@ -23,6 +24,21 @@ class MempoolRelay:
     median_time_past: Callable[[], int]
     input_verifier: InputVerifier
 
+    async def submit(self, tx: Transaction, peers: list[PeerConnection]) -> MempoolEntry:
+        """Admit a local transaction and announce its txid to connected peers."""
+        entry = self.mempool.accept(
+            tx,
+            self.coins(),
+            self.height(),
+            input_verifier=self.input_verifier,
+            median_time_past=self.median_time_past(),
+        )
+        inventory = encode_inventory([InventoryVector(MSG_TX, entry.txid)])
+        for candidate in peers:
+            if candidate.established:
+                await candidate.send("inv", inventory)
+        return entry
+
     async def handle(self, peer: PeerConnection, message: Message, peers: list[PeerConnection]) -> bool:
         """Process tx or inv messages; return whether the message was handled."""
         if message.command == "tx":
@@ -32,19 +48,9 @@ class MempoolRelay:
                 await peer.close()
                 raise
             try:
-                entry = self.mempool.accept(
-                    tx,
-                    self.coins(),
-                    self.height(),
-                    input_verifier=self.input_verifier,
-                    median_time_past=self.median_time_past(),
-                )
+                await self.submit(tx, [candidate for candidate in peers if candidate is not peer])
             except MempoolError:
                 return True
-            inventory = encode_inventory([InventoryVector(MSG_TX, entry.txid)])
-            for candidate in peers:
-                if candidate is not peer and candidate.established:
-                    await candidate.send("inv", inventory)
             return True
         if message.command == "inv":
             try:

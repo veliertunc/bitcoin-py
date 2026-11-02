@@ -139,6 +139,11 @@ class SQLiteNodeStore:
         row = self._db.execute("SELECT header FROM headers WHERE hash=?", (block_hash,)).fetchone()
         return None if row is None else bytes(row[0])
 
+    def header_height(self, block_hash: bytes) -> int | None:
+        """Return the stored height for a validated header hash."""
+        row = self._db.execute("SELECT height FROM headers WHERE hash=?", (block_hash,)).fetchone()
+        return None if row is None else row[0]
+
     def best_block(self) -> bytes | None:
         """Return the persisted active tip hash, if one has been recorded."""
         row = self._db.execute("SELECT value FROM metadata WHERE key='best_block'").fetchone()

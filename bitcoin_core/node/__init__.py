@@ -7,6 +7,7 @@ from .block_sync import BlockSynchronizer
 from .protocol import NodeProtocol
 from .mempool import Mempool, MempoolEntry, MempoolError
 from .relay import MempoolRelay
+from .rpc import NodeRPC, RPCError, RPCServer
 
 __all__ = [
     "BlockIndex",
@@ -19,6 +20,9 @@ __all__ = [
     "MempoolEntry",
     "MempoolError",
     "MempoolRelay",
+    "NodeRPC",
+    "RPCError",
+    "RPCServer",
     "SQLiteNodeStore",
     "block_locator",
     "expected_work_bits",
