@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from bitcoin_core.consensus.params import ConsensusParams
@@ -9,6 +10,7 @@ from bitcoin_core.consensus.pow import block_proof, check_proof_of_work, calcula
 from bitcoin_core.primitives.block import BlockHeader
 
 MEDIAN_TIME_SPAN = 11
+MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60
 
 
 class HeaderValidationError(ValueError):
@@ -113,6 +115,16 @@ class HeaderChain:
             raise HeaderValidationError("unknown previous block")
         if header.timestamp <= previous.median_time_past:
             raise HeaderValidationError("block timestamp is not greater than median-time-past")
+        if header.timestamp > int(time.time()) + MAX_FUTURE_BLOCK_TIME:
+            raise HeaderValidationError("block timestamp is too far in the future")
+        height = previous.height + 1
+        for activation_height, minimum_version, deployment in (
+            (self.params.bip34_height, 2, "BIP34"),
+            (self.params.bip66_height, 3, "BIP66"),
+            (self.params.bip65_height, 4, "BIP65"),
+        ):
+            if activation_height is not None and height >= activation_height and header.version < minimum_version:
+                raise HeaderValidationError(f"block version is below the active {deployment} minimum")
         required_bits = expected_work_bits(previous, header.timestamp, self.params)
         if header.bits != required_bits:
             raise HeaderValidationError("unexpected proof-of-work target")
@@ -123,7 +135,7 @@ class HeaderChain:
             return self.indexes[block_hash]
         index = BlockIndex(
             header,
-            previous.height + 1,
+            height,
             previous,
             previous.chainwork + block_proof(header.bits),
         )

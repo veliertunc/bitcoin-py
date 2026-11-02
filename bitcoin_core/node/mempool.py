@@ -8,10 +8,15 @@ from fractions import Fraction
 
 from bitcoin_core.consensus.chainstate import Coin, CoinsView, InputVerifier
 from bitcoin_core.primitives.transaction import MAX_MONEY, OutPoint, Transaction
+from bitcoin_core.policy.standard import check_standard_inputs, check_standard_transaction
+from bitcoin_core.script.sigops import input_sigop_cost, legacy_sigop_cost
 
 COINBASE_MATURITY = 100
 MSG_TX = 1
 MSG_WTX = 5
+MAX_REPLACEMENT_CANDIDATES = 100
+RBF_SEQUENCE_THRESHOLD = 0xFFFFFFFE
+BYTES_PER_SIGOP = 20
 
 
 class MempoolError(ValueError):
@@ -26,6 +31,11 @@ class MempoolEntry:
     added_at: int
     parents: set[bytes] = field(default_factory=set)
     children: set[bytes] = field(default_factory=set)
+    height: int = 0
+    weight: int = 0
+    vsize_bip141: int = 0
+    sigop_cost: int = 0
+    fee_delta: int = 0
 
     @property
     def txid(self) -> bytes:
@@ -35,16 +45,26 @@ class MempoolEntry:
     def wtxid(self) -> bytes:
         return self.transaction.wtxid
 
+    @property
+    def modified_fee(self) -> int:
+        """Return the saturated mining-policy fee, distinct from paid fee."""
+        return max(-(1 << 63), min((1 << 63) - 1, self.fee + self.fee_delta))
+
 
 @dataclass(slots=True)
 class Mempool:
     """Policy-filtered unconfirmed transactions indexed by txid and spent outpoint."""
 
     max_vbytes: int = 300_000_000
-    min_relay_fee_per_kvb: int = 1_000
+    min_relay_fee_per_kvb: int = 100
+    permit_bare_multisig: bool = True
+    max_datacarrier_bytes: int = 100_000
     entries: dict[bytes, MempoolEntry] = field(default_factory=dict)
     spent_outpoints: dict[tuple[bytes, int], bytes] = field(default_factory=dict)
+    unbroadcast_txs: set[bytes] = field(default_factory=set)
+    fee_deltas: dict[bytes, int] = field(default_factory=dict)
     total_vbytes: int = 0
+    sequence: int = 1
 
     def __post_init__(self) -> None:
         if self.max_vbytes < 0 or self.min_relay_fee_per_kvb < 0:
@@ -75,31 +95,55 @@ class Mempool:
             raise MempoolError("transaction must contain inputs and outputs")
         if any(txin.previous_output.is_null for txin in tx.inputs):
             raise MempoolError("coinbase transactions are not accepted into the mempool")
-        if tx.nLockTime:
-            lock_time_cutoff = height if tx.nLockTime < 500_000_000 else median_time_past
+        standardness = check_standard_transaction(
+            tx,
+            permit_bare_multisig=self.permit_bare_multisig,
+            max_datacarrier_bytes=self.max_datacarrier_bytes,
+        )
+        if not standardness.standard:
+            raise MempoolError(f"non-standard transaction: {standardness.reason}")
+        consensus_params = getattr(input_verifier, "params", None)
+        csv_height = getattr(consensus_params, "csv_height", None)
+        csv_active = (
+            True if consensus_params is None else csv_height is not None and height >= csv_height
+        )
+        if tx.lock_time:
+            lock_time_cutoff = height if tx.lock_time < 500_000_000 else (
+                median_time_past if csv_active else int(time.time())
+            )
             if lock_time_cutoff is None:
                 raise MempoolError("median-time-past is required for time-based locktime")
-            if tx.nLockTime >= lock_time_cutoff and any(txin.sequence != 0xFFFFFFFF for txin in tx.inputs):
+            if tx.lock_time >= lock_time_cutoff and any(txin.sequence != 0xFFFFFFFF for txin in tx.inputs):
                 raise MempoolError("transaction is non-final at the current chain tip")
 
         prevouts: list[Coin] = []
         parents: set[bytes] = set()
         seen: set[tuple[bytes, int]] = set()
         input_value = 0
+        direct_conflicts = {
+            self.spent_outpoints[key]
+            for txin in tx.inputs
+            if (key := (txin.previous_output.txid, txin.previous_output.index)) in self.spent_outpoints
+        }
+        replacements = self._replacement_set(direct_conflicts)
         for input_index, txin in enumerate(tx.inputs):
             key = (txin.previous_output.txid, txin.previous_output.index)
             if key in seen:
                 raise MempoolError("transaction contains duplicate inputs")
             seen.add(key)
-            if key in self.spent_outpoints:
-                raise MempoolError("transaction conflicts with a mempool spend")
             coin = chain_coins.coins.get(key)
             if coin is None:
                 parent = self.entries.get(txin.previous_output.txid)
                 if parent is None or txin.previous_output.index >= len(parent.transaction.outputs):
                     raise MempoolError("transaction input is missing or spent")
                 txout = parent.transaction.outputs[txin.previous_output.index]
-                coin = Coin(txout.value, txout.script_pubkey, height, False)
+                coin = Coin(
+                    txout.value,
+                    txout.script_pubkey,
+                    height,
+                    False,
+                    median_time_past if median_time_past is not None else 0,
+                )
                 parents.add(parent.txid)
             if coin.coinbase and height - coin.height < COINBASE_MATURITY:
                 raise MempoolError("transaction spends an immature coinbase output")
@@ -107,8 +151,30 @@ class Mempool:
             if input_value > MAX_MONEY:
                 raise MempoolError("transaction input value out of range")
             prevouts.append(coin)
+        input_standardness = check_standard_inputs(tx, tuple(prevouts))
+        if not input_standardness.standard:
+            raise MempoolError(f"non-standard inputs: {input_standardness.reason}")
+        if tx.version >= 2 and csv_active:
+            for txin, coin in zip(tx.inputs, prevouts):
+                sequence = txin.sequence
+                if sequence & (1 << 31):
+                    continue
+                relative = sequence & 0x0000FFFF
+                if sequence & (1 << 22):
+                    if median_time_past is None:
+                        raise MempoolError("median-time-past is required for relative time locks")
+                    minimum_time = coin.median_time_past + (relative << 9) - 1
+                    if minimum_time >= median_time_past:
+                        raise MempoolError("transaction sequence time lock is not satisfied")
+                elif coin.height + relative - 1 >= height:
+                    raise MempoolError("transaction sequence height lock is not satisfied")
         for input_index, coin in enumerate(prevouts):
-            if not input_verifier(tx, input_index, coin, tuple(prevouts)):
+            contextual_verifier = getattr(input_verifier, "verify_at_height", None)
+            if contextual_verifier is not None:
+                verified = contextual_verifier(tx, input_index, coin, tuple(prevouts), height)
+            else:
+                verified = input_verifier(tx, input_index, coin, tuple(prevouts))
+            if not verified:
                 raise MempoolError("transaction input script verification failed")
 
         try:
@@ -121,13 +187,59 @@ class Mempool:
         stripped_size = len(tx.serialize(include_witness=False))
         total_size = len(tx.serialize(include_witness=True))
         weight = stripped_size * 3 + total_size
-        vsize = (weight + 3) // 4
-        minimum_fee = (vsize * self.min_relay_fee_per_kvb + 999) // 1_000
-        if fee < minimum_fee:
+        vsize_bip141 = (weight + 3) // 4
+        sigop_cost = legacy_sigop_cost(tx) + input_sigop_cost(tx, tuple(prevouts))
+        vsize = max(vsize_bip141, (sigop_cost * BYTES_PER_SIGOP + 3) // 4)
+        minimum_fee = self._fee_for_rate(vsize, self.min_relay_fee_per_kvb)
+        fee_delta = self.fee_deltas.get(txid, 0)
+        modified_fee = max(-(1 << 63), min((1 << 63) - 1, fee + fee_delta))
+        if modified_fee < minimum_fee:
             raise MempoolError("transaction fee is below the minimum relay fee")
 
-        entry = MempoolEntry(tx, fee, vsize, int(time.time()) if now is None else now, parents)
+        if direct_conflicts:
+            if len(replacements) > MAX_REPLACEMENT_CANDIDATES:
+                raise MempoolError("replacement would evict more than 100 transactions")
+            if not all(self._signals_replaceable(conflict_id) for conflict_id in direct_conflicts):
+                raise MempoolError("conflicting transaction did not signal replaceability")
+            original_inputs = {
+                txin.previous_output.txid
+                for conflict_id in replacements
+                for txin in self.entries[conflict_id].transaction.inputs
+            }
+            if any(
+                txin.previous_output.txid in self.entries
+                and txin.previous_output.txid not in original_inputs
+                for txin in tx.inputs
+            ):
+                raise MempoolError("replacement adds a new unconfirmed input")
+            replaced_fee = sum(self.entries[item].fee for item in replacements)
+            incremental_fee = self._fee_for_rate(vsize, self.min_relay_fee_per_kvb)
+            if fee < replaced_fee + incremental_fee:
+                raise MempoolError("replacement fee does not pay for the conflicts and incremental relay fee")
+            if any(
+                Fraction(fee, vsize) <= Fraction(self.entries[item].fee, self.entries[item].vsize)
+                for item in direct_conflicts
+            ):
+                raise MempoolError("replacement feerate must exceed every direct conflict")
+
+        for conflict_id in sorted(replacements):
+            self.remove(conflict_id, recursive=True)
+            self.clear_prioritisation(conflict_id)
+
+        entry = MempoolEntry(
+            tx,
+            fee,
+            vsize,
+            int(time.time()) if now is None else now,
+            parents,
+            height=height,
+            weight=weight,
+            vsize_bip141=vsize_bip141,
+            sigop_cost=sigop_cost,
+            fee_delta=fee_delta,
+        )
         self.entries[txid] = entry
+        self.sequence += 1
         self.total_vbytes += vsize
         for parent_id in parents:
             self.entries[parent_id].children.add(txid)
@@ -156,6 +268,8 @@ class Mempool:
             entry = self.entries.pop(current, None)
             if entry is None:
                 continue
+            self.sequence += 1
+            self.unbroadcast_txs.discard(current)
             self.total_vbytes -= entry.vsize
             removed.append(current)
             for txin in entry.transaction.inputs:
@@ -180,23 +294,81 @@ class Mempool:
             entry = self.entries.get(tx.txid)
             if entry is not None:
                 removed.extend(self.remove(tx.txid, recursive=False))
+            self.clear_prioritisation(tx.txid)
         for tx in transactions:
             for txin in tx.inputs:
                 spender = self.spent_outpoints.get((txin.previous_output.txid, txin.previous_output.index))
                 if spender is not None and spender not in included:
                     removed.extend(self.remove(spender, recursive=True))
+                    self.clear_prioritisation(spender)
         return tuple(dict.fromkeys(removed))
+
+    def prioritise(self, txid: bytes, fee_delta: int) -> int:
+        """Adjust a transaction's mining score without changing its actual fee."""
+        if len(txid) != 32 or not -(1 << 63) <= fee_delta < (1 << 63):
+            raise ValueError("transaction fee delta must fit int64")
+        current = self.fee_deltas.get(txid, 0)
+        updated = max(-(1 << 63), min((1 << 63) - 1, current + fee_delta))
+        if updated:
+            self.fee_deltas[txid] = updated
+        else:
+            self.fee_deltas.pop(txid, None)
+        entry = self.entries.get(txid)
+        if entry is not None:
+            entry.fee_delta = updated
+        return updated
+
+    def clear_prioritisation(self, txid: bytes) -> None:
+        """Clear a transaction's fee delta when it confirms or conflicts."""
+        self.fee_deltas.pop(txid, None)
+        entry = self.entries.get(txid)
+        if entry is not None:
+            entry.fee_delta = 0
 
     def clear(self) -> None:
         """Remove all mempool entries and dependency indexes."""
+        self.sequence += len(self.entries)
         self.entries.clear()
         self.spent_outpoints.clear()
+        self.unbroadcast_txs.clear()
+        self.fee_deltas.clear()
         self.total_vbytes = 0
 
     def _trim_to_size(self) -> None:
         while self.total_vbytes > self.max_vbytes and self.entries:
             lowest = min(
                 self.entries.values(),
-                key=lambda entry: (Fraction(entry.fee, entry.vsize), entry.added_at, entry.txid),
+                key=lambda entry: (Fraction(entry.modified_fee, entry.vsize), entry.added_at, entry.txid),
             )
             self.remove(lowest.txid, recursive=True)
+
+    def _signals_replaceable(self, txid: bytes, seen: set[bytes] | None = None) -> bool:
+        entry = self.entries.get(txid)
+        if entry is None:
+            return False
+        if any(txin.sequence < RBF_SEQUENCE_THRESHOLD for txin in entry.transaction.inputs):
+            return True
+        visited = set() if seen is None else seen
+        if txid in visited:
+            return False
+        visited.add(txid)
+        return any(self._signals_replaceable(parent, visited) for parent in entry.parents)
+
+    def _replacement_set(self, direct_conflicts: set[bytes]) -> set[bytes]:
+        replacements = set(direct_conflicts)
+        pending = list(direct_conflicts)
+        while pending:
+            current = pending.pop()
+            entry = self.entries.get(current)
+            if entry is None:
+                continue
+            for child in entry.children:
+                if child not in replacements:
+                    replacements.add(child)
+                    pending.append(child)
+        return replacements
+
+    @staticmethod
+    def _fee_for_rate(vsize: int, satoshis_per_kvb: int) -> int:
+        fee = vsize * satoshis_per_kvb // 1_000
+        return max(1, fee) if vsize and satoshis_per_kvb > 0 else fee

@@ -8,6 +8,9 @@ from .protocol import NodeProtocol
 from .mempool import Mempool, MempoolEntry, MempoolError
 from .relay import MempoolRelay
 from .rpc import NodeRPC, RPCError, RPCServer
+from .utxo_stats import calculate_utxo_stats, serialize_utxo_entry
+from .mining import create_block_template
+from .mempool_persistence import MempoolLoadResult, dump_mempool, load_mempool
 
 __all__ = [
     "BlockIndex",
@@ -26,4 +29,10 @@ __all__ = [
     "SQLiteNodeStore",
     "block_locator",
     "expected_work_bits",
+    "calculate_utxo_stats",
+    "serialize_utxo_entry",
+    "create_block_template",
+    "MempoolLoadResult",
+    "dump_mempool",
+    "load_mempool",
 ]

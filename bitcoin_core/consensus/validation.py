@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 from bitcoin_core.consensus.params import ConsensusParams
 from bitcoin_core.consensus.pow import check_proof_of_work
+from bitcoin_core.crypto.hashes import hash256
 from bitcoin_core.primitives.block import Block, merkle_root
+from bitcoin_core.script.sigops import MAX_BLOCK_SIGOP_COST, legacy_sigop_cost
 from bitcoin_core.serialization.compact_size import write_compact_size
 
 MAX_BLOCK_WEIGHT = 4_000_000
@@ -45,6 +47,8 @@ def check_block(block: Block, params: ConsensusParams, *, check_pow: bool = True
     stripped_size += sum(len(tx.serialize(include_witness=False)) for tx in block.transactions)
     if stripped_size * 3 + total_size > MAX_BLOCK_WEIGHT:
         return BlockCheckResult(False, "block weight exceeds maximum")
+    if sum(legacy_sigop_cost(tx) for tx in block.transactions) > MAX_BLOCK_SIGOP_COST:
+        return BlockCheckResult(False, "block signature-operation cost exceeds maximum")
     try:
         for tx in block.transactions:
             tx.output_value()
@@ -59,6 +63,32 @@ def check_block(block: Block, params: ConsensusParams, *, check_pow: bool = True
         return BlockCheckResult(False, "mutated Merkle tree")
     if root != block.header.merkle_root:
         return BlockCheckResult(False, "Merkle root mismatch")
+    witness_txs = [tx for tx in block.transactions if tx.has_witness]
+    coinbase = block.transactions[0]
+    commitment_prefix = bytes.fromhex("6a24aa21a9ed")
+    commitment = None
+    for output in coinbase.outputs:
+        script = output.script_pubkey
+        if len(script) >= 38 and script.startswith(commitment_prefix):
+            commitment = script[6:38]
+    if witness_txs or commitment is not None:
+        if commitment is None:
+            return BlockCheckResult(False, "witness data has no coinbase commitment")
+        witness = coinbase.inputs[0].witness
+        if len(witness) != 1 or len(witness[0]) != 32:
+            return BlockCheckResult(False, "coinbase witness reserved value is malformed")
+        witness_root, witness_mutated = merkle_root(
+            [bytes(32), *(tx.wtxid for tx in block.transactions[1:])]
+        )
+        if witness_mutated:
+            return BlockCheckResult(False, "mutated witness Merkle tree")
+        if hash256(witness_root + witness[0]) != commitment:
+            return BlockCheckResult(False, "witness commitment mismatch")
     if check_pow and not check_proof_of_work(block.header, params):
         return BlockCheckResult(False, "proof of work does not match target")
+    if params.signet_challenge and block.header.previous_block != bytes(32):
+        from bitcoin_core.consensus.signet import check_signet_block_solution
+
+        if not check_signet_block_solution(block, params.signet_challenge):
+            return BlockCheckResult(False, "signet block challenge is not satisfied")
     return BlockCheckResult(True)

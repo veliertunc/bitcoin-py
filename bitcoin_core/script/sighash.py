@@ -168,8 +168,12 @@ class TransactionSignatureChecker:
     witness_v0: bool = False
     strict_hash_type: bool = False
     low_s: bool = False
+    strict_der: bool = True
+    compressed_pubkeys_only: bool = False
 
     def __call__(self, signature: bytes, public_key: bytes, script_code: bytes) -> bool:
+        if self.compressed_pubkeys_only and len(public_key) != 33:
+            return False
         if len(signature) < 2:
             return False
         encoded_signature, hash_type = signature[:-1], signature[-1]
@@ -185,4 +189,10 @@ class TransactionSignatureChecker:
             digest = legacy_signature_hash(
                 self.transaction, self.input_index, script_code, hash_type, signature
             )
-        return verify_ecdsa(digest, encoded_signature, public_key, low_s=self.low_s)
+        return verify_ecdsa(
+            digest,
+            encoded_signature,
+            public_key,
+            low_s=self.low_s,
+            strict_der=self.strict_der,
+        )

@@ -88,14 +88,123 @@ def parse_der_signature(encoded: bytes) -> tuple[int, int]:
     return r, s
 
 
-def verify_ecdsa(message_hash: bytes, der_signature: bytes, public_key: bytes, *, low_s: bool = False) -> bool:
-    """Verify strict DER ECDSA over a 32-byte message digest."""
+def is_strict_der_signature(encoded_with_hash_type: bytes) -> bool:
+    """Check the BIP66 encoding rules without requiring valid ECDSA scalars."""
+    size = len(encoded_with_hash_type)
+    if not 9 <= size <= 73 or encoded_with_hash_type[0] != 0x30:
+        return False
+    if encoded_with_hash_type[1] != size - 3 or encoded_with_hash_type[2] != 0x02:
+        return False
+    r_size = encoded_with_hash_type[3]
+    if r_size == 0 or 5 + r_size >= size:
+        return False
+    r_first = encoded_with_hash_type[4]
+    if r_first & 0x80:
+        return False
+    if r_size > 1 and r_first == 0 and not encoded_with_hash_type[5] & 0x80:
+        return False
+    s_tag = 4 + r_size
+    if encoded_with_hash_type[s_tag] != 0x02:
+        return False
+    s_size = encoded_with_hash_type[s_tag + 1]
+    if s_size == 0 or r_size + s_size + 7 != size:
+        return False
+    s_first = encoded_with_hash_type[s_tag + 2]
+    if s_first & 0x80:
+        return False
+    if s_size > 1 and s_first == 0 and not encoded_with_hash_type[s_tag + 3] & 0x80:
+        return False
+    return True
+
+
+def parse_der_signature_lax(encoded: bytes) -> tuple[int, int]:
+    """Parse the historical libsecp256k1 lax-DER signature format."""
+    position = 0
+    if not encoded or encoded[position] != 0x30:
+        raise ValueError("invalid ECDSA sequence tag")
+    position += 1
+
+    def read_length(*, allow_long: bool) -> int:
+        nonlocal position
+        if position >= len(encoded):
+            raise ValueError("truncated ECDSA length")
+        length = encoded[position]
+        position += 1
+        if not length & 0x80:
+            return length
+        if not allow_long:
+            raise ValueError("long ECDSA length is not allowed")
+        byte_count = length & 0x7F
+        if byte_count > len(encoded) - position:
+            raise ValueError("truncated long ECDSA length")
+        while byte_count and encoded[position] == 0:
+            position += 1
+            byte_count -= 1
+        if byte_count >= 8:
+            raise ValueError("ECDSA length overflows size_t")
+        result = 0
+        while byte_count:
+            result = (result << 8) | encoded[position]
+            position += 1
+            byte_count -= 1
+        return result
+
+    # The historical parser intentionally skips, but does not decode, this length.
+    if position >= len(encoded):
+        raise ValueError("truncated ECDSA sequence length")
+    sequence_length = encoded[position]
+    position += 1
+    if sequence_length & 0x80:
+        sequence_length &= 0x7F
+        if sequence_length > len(encoded) - position:
+            raise ValueError("truncated long ECDSA sequence length")
+        position += sequence_length
+    if position >= len(encoded) or encoded[position] != 0x02:
+        raise ValueError("invalid ECDSA r tag")
+    position += 1
+    r_length = read_length(allow_long=True)
+    if r_length > len(encoded) - position:
+        raise ValueError("truncated ECDSA r integer")
+    r_data = encoded[position : position + r_length]
+    position += r_length
+
+    if position >= len(encoded) or encoded[position] != 0x02:
+        raise ValueError("invalid ECDSA s tag")
+    position += 1
+    s_length = read_length(allow_long=True)
+    if s_length > len(encoded) - position:
+        raise ValueError("truncated ECDSA s integer")
+    s_data = encoded[position : position + s_length]
+
+    r_data = r_data.lstrip(b"\x00")
+    s_data = s_data.lstrip(b"\x00")
+    if len(r_data) > 32 or len(s_data) > 32:
+        return 0, 0
+    r = int.from_bytes(r_data, "big")
+    s = int.from_bytes(s_data, "big")
+    if not 1 <= r < ORDER or not 1 <= s < ORDER:
+        return 0, 0
+    return r, s
+
+
+def verify_ecdsa(
+    message_hash: bytes,
+    der_signature: bytes,
+    public_key: bytes,
+    *,
+    low_s: bool = False,
+    strict_der: bool = True,
+) -> bool:
+    """Verify strict-DER or historical lax-DER ECDSA over a 32-byte digest."""
     if len(message_hash) != 32:
         return False
     try:
-        r, s = parse_der_signature(der_signature)
+        parser = parse_der_signature if strict_der else parse_der_signature_lax
+        r, s = parser(der_signature)
         point = parse_public_key(public_key)
     except ValueError:
+        return False
+    if not 1 <= r < ORDER or not 1 <= s < ORDER:
         return False
     if low_s and s > ORDER // 2:
         return False

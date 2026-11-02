@@ -24,7 +24,13 @@ class MempoolRelay:
     median_time_past: Callable[[], int]
     input_verifier: InputVerifier
 
-    async def submit(self, tx: Transaction, peers: list[PeerConnection]) -> MempoolEntry:
+    async def submit(
+        self,
+        tx: Transaction,
+        peers: list[PeerConnection],
+        *,
+        unbroadcast: bool = False,
+    ) -> MempoolEntry:
         """Admit a local transaction and announce its txid to connected peers."""
         entry = self.mempool.accept(
             tx,
@@ -33,10 +39,15 @@ class MempoolRelay:
             input_verifier=self.input_verifier,
             median_time_past=self.median_time_past(),
         )
+        if unbroadcast:
+            self.mempool.unbroadcast_txs.add(entry.txid)
         inventory = encode_inventory([InventoryVector(MSG_TX, entry.txid)])
         for candidate in peers:
-            if candidate.established:
-                await candidate.send("inv", inventory)
+            if candidate.established and entry.fee * 1_000 >= candidate.fee_filter * entry.vsize:
+                try:
+                    await candidate.send("inv", inventory)
+                except (ConnectionError, OSError):
+                    continue
         return entry
 
     async def handle(self, peer: PeerConnection, message: Message, peers: list[PeerConnection]) -> bool:
@@ -60,6 +71,12 @@ class MempoolRelay:
                 raise
             requests = []
             for item in announced:
+                if item.type == MSG_TX:
+                    self.mempool.unbroadcast_txs.discard(item.hash)
+                elif item.type == MSG_WTX:
+                    transaction = self.mempool.get_by_wtxid(item.hash)
+                    if transaction is not None:
+                        self.mempool.unbroadcast_txs.discard(transaction.txid)
                 if item.type == MSG_TX and self.mempool.get(item.hash) is None:
                     requests.append(item)
                 elif item.type == MSG_WTX and self.mempool.get_by_wtxid(item.hash) is None:
@@ -89,3 +106,14 @@ class MempoolRelay:
             else:
                 await peer.send("tx", tx.serialize(include_witness=True))
         return missing
+
+    async def serve_mempool(self, peer: PeerConnection) -> int:
+        """Answer a BIP35 mempool request with fee-filtered transaction inventory."""
+        inventory = [
+            InventoryVector(MSG_TX, entry.txid)
+            for entry in self.mempool.entries.values()
+            if entry.fee * 1_000 >= peer.fee_filter * entry.vsize
+        ]
+        for start in range(0, len(inventory), 50_000):
+            await peer.send("inv", encode_inventory(inventory[start : start + 50_000]))
+        return len(inventory)

@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from io import BytesIO
 from typing import BinaryIO
 
+from bitcoin_core.network.version import NetworkAddress
 from bitcoin_core.primitives.block import BlockHeader
 from bitcoin_core.serialization.compact_size import read_compact_size, write_compact_size
 
 MAX_INV_ENTRIES = 50_000
 MAX_HEADERS = 2_000
 MAX_BLOCK_LOCATORS = 101
+MAX_ADDR_ENTRIES = 1_000
 
 
 def _read_exact(stream: BinaryIO, length: int) -> bytes:
@@ -24,6 +26,42 @@ def _read_exact(stream: BinaryIO, length: int) -> bytes:
 def _ensure_consumed(stream: BytesIO) -> None:
     if stream.read(1):
         raise ValueError("trailing bytes in P2P message payload")
+
+
+@dataclass(frozen=True, slots=True)
+class TimestampedAddress:
+    """An address record as transmitted in an ``addr`` message."""
+
+    timestamp: int
+    address: NetworkAddress
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.timestamp <= 0xFFFFFFFF:
+            raise ValueError("address timestamp must fit in uint32")
+
+    def serialize(self) -> bytes:
+        return self.timestamp.to_bytes(4, "little") + self.address.serialize()
+
+
+def encode_addr(entries: tuple[TimestampedAddress, ...] | list[TimestampedAddress]) -> bytes:
+    """Serialize a legacy P2P ``addr`` message."""
+    if len(entries) > MAX_ADDR_ENTRIES:
+        raise ValueError("addr message exceeds 1,000 entries")
+    return write_compact_size(len(entries)) + b"".join(item.serialize() for item in entries)
+
+
+def decode_addr(payload: bytes) -> tuple[TimestampedAddress, ...]:
+    """Parse a legacy P2P ``addr`` message and reject trailing data."""
+    stream = BytesIO(payload)
+    count = read_compact_size(stream)
+    if count > MAX_ADDR_ENTRIES:
+        raise ValueError("addr message exceeds 1,000 entries")
+    entries = []
+    for _ in range(count):
+        timestamp = int.from_bytes(_read_exact(stream, 4), "little")
+        entries.append(TimestampedAddress(timestamp, NetworkAddress.deserialize(stream)))
+    _ensure_consumed(stream)
+    return tuple(entries)
 
 
 @dataclass(frozen=True, slots=True)

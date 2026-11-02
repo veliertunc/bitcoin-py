@@ -78,6 +78,8 @@ def verify_witness_v0(
         witness_v0=True,
         strict_hash_type=bool(flags & ScriptFlags.STRICTENC),
         low_s=bool(flags & ScriptFlags.LOW_S),
+        strict_der=bool(flags & ScriptFlags.DERSIG),
+        compressed_pubkeys_only=bool(flags & ScriptFlags.WITNESS_PUBKEYTYPE),
     )
     try:
         result = eval_script(
@@ -86,6 +88,7 @@ def verify_witness_v0(
             checker=checker,
             flags=flags | ScriptFlags.CLEAN_STACK,
             tx_context=ScriptTransactionContext(tx, input_index),
+            witness_v0=True,
         )
     except (ScriptError, ValueError):
         return False

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from bitcoin_core.network.connection import PeerConnection
 from bitcoin_core.network.messages import MAX_HEADERS, GetHeaders, decode_headers, encode_headers
 from bitcoin_core.network.protocol import MAINNET_MAGIC, Message, encode_message
-from bitcoin_core.node.chain import HeaderChain, HeaderValidationError
+from bitcoin_core.node.chain import BlockIndex, HeaderChain, HeaderValidationError
 
 
 def block_locator(chain: HeaderChain) -> tuple[bytes, ...]:
@@ -37,6 +38,7 @@ class HeaderSynchronizer:
     chain: HeaderChain
     protocol_version: int = 70_016
     magic: bytes = MAINNET_MAGIC
+    persist_header: Callable[[BlockIndex], object] | None = None
 
     def request(self) -> bytes:
         """Return an encoded getheaders request from the current active tip."""
@@ -80,7 +82,9 @@ class HeaderSynchronizer:
         try:
             headers = decode_headers(message.payload)
             for header in headers:
-                self.chain.add_header(header)
+                index = self.chain.add_header(header)
+                if self.persist_header is not None:
+                    self.persist_header(index)
         except (ValueError, HeaderValidationError):
             await peer.close()
             raise

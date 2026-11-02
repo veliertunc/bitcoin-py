@@ -15,9 +15,16 @@ from bitcoin_core.consensus.chainstate import (
     disconnect_block as apply_disconnect,
 )
 from bitcoin_core.consensus.params import ConsensusParams
+from bitcoin_core.consensus.blockfilter import (
+    basic_filter_elements,
+    compact_filter_hash,
+    compact_filter_header,
+    encode_basic_filter,
+)
 from bitcoin_core.node.chain import BlockIndex
 from bitcoin_core.node.chain import HeaderChain
 from bitcoin_core.primitives.block import Block, BlockHeader
+from bitcoin_core.primitives.transaction import Transaction
 
 
 class SQLiteNodeStore:
@@ -56,11 +63,26 @@ class SQLiteNodeStore:
                 script_pubkey BLOB NOT NULL,
                 height INTEGER NOT NULL,
                 coinbase INTEGER NOT NULL CHECK(coinbase IN (0, 1)),
+                median_time_past INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(txid, output_index)
             );
             CREATE TABLE IF NOT EXISTS undo (
                 block_hash BLOB PRIMARY KEY CHECK(length(block_hash) = 32),
                 payload BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tx_index (
+                txid BLOB PRIMARY KEY CHECK(length(txid) = 32),
+                block_hash BLOB NOT NULL CHECK(length(block_hash) = 32),
+                height INTEGER NOT NULL,
+                tx_position INTEGER NOT NULL,
+                payload BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS tx_index_by_block ON tx_index(block_hash);
+            CREATE TABLE IF NOT EXISTS basic_filters (
+                block_hash BLOB PRIMARY KEY CHECK(length(block_hash) = 32),
+                encoded_filter BLOB NOT NULL,
+                filter_hash BLOB NOT NULL CHECK(length(filter_hash) = 32),
+                filter_header BLOB NOT NULL CHECK(length(filter_header) = 32)
             );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -71,6 +93,9 @@ class SQLiteNodeStore:
         columns = {row[1] for row in self._db.execute("PRAGMA table_info(blocks)")}
         if "active" not in columns:
             self._db.execute("ALTER TABLE blocks ADD COLUMN active INTEGER NOT NULL DEFAULT 0")
+        coin_columns = {row[1] for row in self._db.execute("PRAGMA table_info(coins)")}
+        if "median_time_past" not in coin_columns:
+            self._db.execute("ALTER TABLE coins ADD COLUMN median_time_past INTEGER NOT NULL DEFAULT 0")
         self._db.commit()
 
     def close(self) -> None:
@@ -83,7 +108,7 @@ class SQLiteNodeStore:
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.close()
 
-    def save_header(self, index: BlockIndex, *, active: bool = False) -> None:
+    def save_header(self, index: BlockIndex, *, active: bool | None = None) -> None:
         """Insert or update one validated header index entry."""
         previous_hash = index.header.previous_block
         with self._db:
@@ -92,14 +117,16 @@ class SQLiteNodeStore:
                    VALUES(?, ?, ?, ?, ?, ?)
                    ON CONFLICT(hash) DO UPDATE SET previous_hash=excluded.previous_hash,
                        height=excluded.height, chainwork=excluded.chainwork,
-                       header=excluded.header, active=excluded.active""",
+                       header=excluded.header,
+                       active=CASE WHEN ? IS NULL THEN headers.active ELSE excluded.active END""",
                 (
                     index.block_hash,
                     previous_hash,
                     index.height,
                     str(index.chainwork),
                     index.header.serialize(),
-                    int(active),
+                    int(bool(active)),
+                    None if active is None else int(active),
                 ),
             )
 
@@ -120,9 +147,84 @@ class SQLiteNodeStore:
         row = self._db.execute("SELECT payload FROM blocks WHERE hash=?", (block_hash,)).fetchone()
         return None if row is None else Block.deserialize(row[0])
 
+    def load_undo(self, block_hash: bytes) -> BlockUndo | None:
+        """Load persisted undo data for one connected block, if retained."""
+        row = self._db.execute("SELECT payload FROM undo WHERE block_hash=?", (block_hash,)).fetchone()
+        return None if row is None else _decode_undo(bytes(row[0]))
+
+    def load_basic_filter(self, block_hash: bytes) -> tuple[bytes, bytes] | None:
+        """Load or lazily index a block's BIP158 filter and BIP157 header."""
+        row = self._db.execute(
+            "SELECT encoded_filter, filter_header FROM basic_filters WHERE block_hash=?",
+            (block_hash,),
+        ).fetchone()
+        if row is not None:
+            return bytes(row[0]), bytes(row[1])
+
+        pending: list[tuple[bytes, bytes]] = []
+        cursor = block_hash
+        previous_header = bytes(32)
+        while True:
+            cached = self._db.execute(
+                "SELECT filter_header FROM basic_filters WHERE block_hash=?", (cursor,)
+            ).fetchone()
+            if cached is not None:
+                previous_header = bytes(cached[0])
+                break
+            header_row = self._db.execute(
+                "SELECT previous_hash FROM headers WHERE hash=?", (cursor,)
+            ).fetchone()
+            block_row = self._db.execute("SELECT 1 FROM blocks WHERE hash=?", (cursor,)).fetchone()
+            undo_row = self._db.execute("SELECT 1 FROM undo WHERE block_hash=?", (cursor,)).fetchone()
+            if header_row is None or block_row is None or undo_row is None:
+                return None
+            parent_hash = bytes(header_row[0])
+            pending.append((cursor, parent_hash))
+            if parent_hash == bytes(32):
+                break
+            cursor = parent_hash
+
+        for current_hash, parent_hash in reversed(pending):
+            block = self.load_block(current_hash)
+            undo = self.load_undo(current_hash)
+            if block is None or undo is None:
+                return None
+            encoded = encode_basic_filter(current_hash, basic_filter_elements(block, undo))
+            filter_hash = compact_filter_hash(encoded)
+            filter_header = compact_filter_header(filter_hash, previous_header)
+            with self._db:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO basic_filters(block_hash, encoded_filter, filter_hash, filter_header) "
+                    "VALUES(?, ?, ?, ?)",
+                    (current_hash, encoded, filter_hash, filter_header),
+                )
+            previous_header = filter_header
+
+        row = self._db.execute(
+            "SELECT encoded_filter, filter_header FROM basic_filters WHERE block_hash=?",
+            (block_hash,),
+        ).fetchone()
+        return None if row is None else (bytes(row[0]), bytes(row[1]))
+
     def has_block(self, block_hash: bytes) -> bool:
         """Return whether serialized block data is available locally."""
         return self._db.execute("SELECT 1 FROM blocks WHERE hash=?", (block_hash,)).fetchone() is not None
+
+    def is_active_block(self, block_hash: bytes) -> bool:
+        """Return whether a known block belongs to the active chain."""
+        return self._db.execute(
+            "SELECT 1 FROM blocks WHERE hash=? AND active=1", (block_hash,)
+        ).fetchone() is not None
+
+    def find_transaction(self, txid: bytes) -> tuple[bytes, int, int, Transaction] | None:
+        """Find a transaction in the active-chain transaction index."""
+        row = self._db.execute(
+            "SELECT block_hash, height, tx_position, payload FROM tx_index WHERE txid=?",
+            (txid,),
+        ).fetchone()
+        if row is None:
+            return None
+        return bytes(row[0]), int(row[1]), int(row[2]), Transaction.deserialize(bytes(row[3]))
 
     def discard_side_blocks(self, block_hashes: tuple[bytes, ...]) -> None:
         """Remove downloaded block bodies that have not been connected."""
@@ -133,6 +235,14 @@ class SQLiteNodeStore:
         """Return the connected active-chain block hash at a height."""
         row = self._db.execute("SELECT hash FROM blocks WHERE height=? AND active=1", (height,)).fetchone()
         return None if row is None else bytes(row[0])
+
+    def active_transaction_count(self, height: int) -> int:
+        """Return the cumulative transaction count through an active-chain height."""
+        row = self._db.execute(
+            "SELECT COALESCE(SUM(tx_count), 0) FROM blocks WHERE active=1 AND height<=?",
+            (height,),
+        ).fetchone()
+        return int(row[0])
 
     def load_header(self, block_hash: bytes) -> bytes | None:
         """Return the serialized 80-byte header for a block hash."""
@@ -170,27 +280,49 @@ class SQLiteNodeStore:
             else:
                 chain.add_header(header)
 
-    def load_coins(self) -> CoinsView:
+    def load_coins(self, chain: HeaderChain | None = None) -> CoinsView:
         """Load the persisted UTXO set into an in-memory view."""
         rows = self._db.execute(
-            "SELECT txid, output_index, value, script_pubkey, height, coinbase FROM coins"
+            "SELECT txid, output_index, value, script_pubkey, height, coinbase, median_time_past FROM coins"
         )
         view = CoinsView()
-        view.coins = {
-            (bytes(txid), index): Coin(value, bytes(script), height, bool(coinbase))
-            for txid, index, value, script, height, coinbase in rows
-        }
+        for txid, index, value, script, height, coinbase, median_time_past in rows:
+            if median_time_past == 0 and chain is not None and height > 0 and chain.tip is not None:
+                parent = chain.tip.ancestor(height - 1)
+                if parent is not None:
+                    median_time_past = parent.median_time_past
+            view.coins[(bytes(txid), index)] = Coin(
+                value, bytes(script), height, bool(coinbase), median_time_past
+            )
         return view
+
+    def iter_coins(self):
+        """Stream UTXO records in the same transaction-id/index order as the database."""
+        rows = self._db.execute(
+            "SELECT txid, output_index, value, script_pubkey, height, coinbase, median_time_past "
+            "FROM coins ORDER BY txid, output_index"
+        )
+        for txid, output_index, value, script, height, coinbase, median_time_past in rows:
+            yield (bytes(txid), int(output_index)), Coin(
+                int(value), bytes(script), int(height), bool(coinbase), int(median_time_past)
+            )
+
+    def utxo_summary(self) -> tuple[int, int, int]:
+        """Return output count, distinct transaction count, and total satoshis."""
+        row = self._db.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT txid), COALESCE(SUM(value), 0) FROM coins"
+        ).fetchone()
+        return int(row[0]), int(row[1]), int(row[2])
 
     def save_coins(self, view: CoinsView) -> None:
         """Replace the stored UTXO set with a supplied complete view."""
         with self._db:
             self._db.execute("DELETE FROM coins")
             self._db.executemany(
-                "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase) "
-                "VALUES(?, ?, ?, ?, ?, ?)",
+                "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase, median_time_past) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
                 (
-                    (txid, index, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase))
+                    (txid, index, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase), coin.median_time_past)
                     for (txid, index), coin in view.coins.items()
                 ),
             )
@@ -224,6 +356,7 @@ class SQLiteNodeStore:
                 "ON CONFLICT(block_hash) DO UPDATE SET payload=excluded.payload",
                 (index.block_hash, undo_payload),
             )
+            self._index_block_transactions(block, index)
             self._db.executemany(
                 "DELETE FROM coins WHERE txid=? AND output_index=?",
                 ((txid, index_num) for (txid, index_num), _coin in undo.spent),
@@ -276,17 +409,18 @@ class SQLiteNodeStore:
                 undo.created,
             )
             self._db.executemany(
-                "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase) "
-                "VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(txid, output_index) DO UPDATE SET "
+                "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase, median_time_past) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(txid, output_index) DO UPDATE SET "
                 "value=excluded.value, script_pubkey=excluded.script_pubkey, "
-                "height=excluded.height, coinbase=excluded.coinbase",
+                "height=excluded.height, coinbase=excluded.coinbase, median_time_past=excluded.median_time_past",
                 (
-                    (txid, index_num, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase))
+                    (txid, index_num, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase), coin.median_time_past)
                     for (txid, index_num), coin in undo.spent
                 ),
             )
             self._db.execute("UPDATE headers SET active=0 WHERE hash=?", (block_hash,))
             self._db.execute("UPDATE blocks SET active=0 WHERE hash=?", (block_hash,))
+            self._db.execute("DELETE FROM tx_index WHERE block_hash=?", (block_hash,))
             self._db.execute("UPDATE headers SET active=1 WHERE hash=?", (previous_hash,))
             self._db.execute("UPDATE blocks SET active=1 WHERE hash=?", (previous_hash,))
             self._db.execute(
@@ -346,6 +480,7 @@ class SQLiteNodeStore:
                 params,
                 input_verifier=input_verifier,
                 check_pow=check_pow,
+                median_time_past=index.previous.median_time_past if index.previous is not None else 0,
             )
             new_undos.append(undo)
             expected_parent = index.block_hash
@@ -365,21 +500,24 @@ class SQLiteNodeStore:
                     undo.created,
                 )
                 self._db.executemany(
-                    "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase) "
-                    "VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(txid, output_index) DO UPDATE SET "
+                    "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase, median_time_past) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(txid, output_index) DO UPDATE SET "
                     "value=excluded.value, script_pubkey=excluded.script_pubkey, "
-                    "height=excluded.height, coinbase=excluded.coinbase",
+                    "height=excluded.height, coinbase=excluded.coinbase, median_time_past=excluded.median_time_past",
                     (
-                        (txid, output_index, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase))
+                        (txid, output_index, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase), coin.median_time_past)
                         for (txid, output_index), coin in undo.spent
                     ),
                 )
                 self._db.execute("UPDATE blocks SET active=0 WHERE hash=?", (_block_hash,))
+                self._db.execute("DELETE FROM tx_index WHERE block_hash=?", (_block_hash,))
             for undo in new_undos:
                 self._db.executemany(
                     "DELETE FROM coins WHERE txid=? AND output_index=?",
                     ((txid, output_index) for (txid, output_index), _coin in undo.spent),
                 )
+            for block, index in zip(new_blocks, new_indexes):
+                self._index_block_transactions(block, index)
             for txid, output_index in created_new:
                 coin = staged.coins.get((txid, output_index))
                 if coin is None:
@@ -439,6 +577,7 @@ class SQLiteNodeStore:
             params,
             input_verifier=input_verifier,
             check_pow=check_pow,
+            median_time_past=index.previous.median_time_past if index.previous is not None else 0,
         )
         try:
             self.persist_connected_block(block, index, undo, view)
@@ -453,11 +592,36 @@ class SQLiteNodeStore:
 
     def _put_coin(self, txid: bytes, output_index: int, coin: Coin) -> None:
         self._db.execute(
-            "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase) "
-            "VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(txid, output_index) DO UPDATE SET "
+            "INSERT INTO coins(txid, output_index, value, script_pubkey, height, coinbase, median_time_past) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(txid, output_index) DO UPDATE SET "
             "value=excluded.value, script_pubkey=excluded.script_pubkey, "
-            "height=excluded.height, coinbase=excluded.coinbase",
-            (txid, output_index, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase)),
+            "height=excluded.height, coinbase=excluded.coinbase, median_time_past=excluded.median_time_past",
+            (txid, output_index, coin.value, coin.script_pubkey, coin.height, int(coin.coinbase), coin.median_time_past),
+        )
+
+    def remove_unspendable_genesis_coinbase(self, block: Block) -> None:
+        """Remove an incorrectly persisted genesis output from older Python databases."""
+        if not block.transactions:
+            return
+        txid = block.transactions[0].txid
+        with self._db:
+            self._db.execute(
+                "DELETE FROM coins WHERE txid=? AND height=0 AND coinbase=1",
+                (txid,),
+            )
+            self._db.execute("DELETE FROM undo WHERE block_hash=?", (block.header.block_hash,))
+
+    def _index_block_transactions(self, block: Block, index: BlockIndex) -> None:
+        """Replace active-chain transaction index rows for one block."""
+        self._db.execute("DELETE FROM tx_index WHERE block_hash=?", (index.block_hash,))
+        self._db.executemany(
+            "INSERT INTO tx_index(txid, block_hash, height, tx_position, payload) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(txid) DO UPDATE SET block_hash=excluded.block_hash, height=excluded.height, "
+            "tx_position=excluded.tx_position, payload=excluded.payload",
+            (
+                (tx.txid, index.block_hash, index.height, position, tx.serialize())
+                for position, tx in enumerate(block.transactions)
+            ),
         )
 
 
@@ -465,7 +629,7 @@ def _encode_undo(undo: BlockUndo) -> bytes:
     data = {
         "height": undo.height,
         "spent": [
-            [txid.hex(), index, coin.value, coin.script_pubkey.hex(), coin.height, coin.coinbase]
+            [txid.hex(), index, coin.value, coin.script_pubkey.hex(), coin.height, coin.coinbase, coin.median_time_past]
             for (txid, index), coin in undo.spent
         ],
         "created": [[txid.hex(), index] for txid, index in undo.created],
@@ -478,9 +642,10 @@ def _decode_undo(payload: bytes) -> BlockUndo:
     spent = tuple(
         (
             (bytes.fromhex(txid), index),
-            Coin(value, bytes.fromhex(script), height, coinbase),
+            Coin(value, bytes.fromhex(script), height, coinbase, spent_row[6] if len(spent_row) > 6 else 0),
         )
-        for txid, index, value, script, height, coinbase in data["spent"]
+        for spent_row in data["spent"]
+        for txid, index, value, script, height, coinbase in [spent_row[:6]]
     )
     created = tuple((bytes.fromhex(txid), index) for txid, index in data["created"])
     return BlockUndo(data["height"], spent, created)

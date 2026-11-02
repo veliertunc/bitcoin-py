@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitcoin-core-python-port"
+version = "0.1.0"
+description = "A modular Python implementation of Bitcoin Core node protocols and consensus components"
+readme = "bitcoin_core/README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Bitcoin Core Python Port contributors" }]
+dependencies = []
+
+[project.scripts]
+bitcoin-py-node = "bitcoin_core.node.app:main"
+
+[tool.setuptools.packages.find]
+include = ["bitcoin_core*"]

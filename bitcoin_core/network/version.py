@@ -11,6 +11,8 @@ from bitcoin_core.serialization.compact_size import read_compact_size, write_com
 MIN_VERSION_WITH_ADDR = 106
 MIN_VERSION_WITH_RELAY = 70_001
 MAX_USER_AGENT_LENGTH = 256
+NODE_NETWORK = 1
+NODE_COMPACT_FILTERS = 1 << 6
 
 
 def _read_exact(stream: BytesIO, length: int) -> bytes:

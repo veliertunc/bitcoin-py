@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from bitcoin_core.consensus.params import ConsensusParams, MAINNET, REGTEST, TESTNET
+from bitcoin_core.consensus.params import ConsensusParams, MAINNET, REGTEST
 from bitcoin_core.primitives.block import Block, BlockHeader
 from bitcoin_core.primitives.transaction import OutPoint, Transaction, TxInput, TxOutput
 from bitcoin_core.script.interpreter import encode_script_num
@@ -75,9 +75,42 @@ def _genesis(network: str) -> Block:
     return Block(header, (coinbase,))
 
 
-TESTNET3 = ConsensusParams(pow_limit=_MAINNET_LIMIT, allow_min_difficulty=True)
+TESTNET3 = ConsensusParams(
+    pow_limit=_MAINNET_LIMIT,
+    allow_min_difficulty=True,
+    bip34_height=21_111,
+    p2sh_height=514,
+    bip66_height=330_776,
+    bip65_height=581_885,
+    csv_height=770_112,
+    segwit_height=834_624,
+    script_flag_exceptions=(
+        (bytes.fromhex("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105")[::-1], 0),
+    ),
+)
+TESTNET4_CONSENSUS = ConsensusParams(
+    pow_limit=_MAINNET_LIMIT,
+    allow_min_difficulty=True,
+    enforce_bip94=True,
+    bip34_height=1,
+    p2sh_height=1,
+    bip66_height=1,
+    bip65_height=1,
+    csv_height=1,
+    segwit_height=1,
+)
 SIGNET = ConsensusParams(
     pow_limit=int("00000377ae000000000000000000000000000000000000000000000000000000", 16),
+    bip34_height=1,
+    signet_challenge=bytes.fromhex(
+        "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be4302"
+        "10359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae"
+    ),
+    p2sh_height=1,
+    bip66_height=1,
+    bip65_height=1,
+    csv_height=1,
+    segwit_height=1,
 )
 
 MAIN = ChainParams(
@@ -112,7 +145,7 @@ TESTNET4 = ChainParams(
     bytes.fromhex("1c163f28"),
     48333,
     48332,
-    TESTNET,
+    TESTNET4_CONSENSUS,
     _genesis("testnet4"),
     ("seed.testnet4.bitcoin.sprovoost.nl", "seed.testnet4.wiz.biz"),
 )

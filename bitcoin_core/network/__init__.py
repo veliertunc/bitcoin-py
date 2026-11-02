@@ -12,7 +12,15 @@ from .protocol import (
     encode_message,
 )
 from .messages import GetHeaders, InventoryVector, decode_headers, decode_inventory, encode_headers, encode_inventory
-from .version import NetworkAddress, VersionMessage
+from .compact_filters import (
+    decode_cfheaders,
+    decode_filter_checkpoints,
+    decode_filter_range,
+    encode_cfcheckpt,
+    encode_cfheaders,
+    encode_cfilter,
+)
+from .version import NODE_COMPACT_FILTERS, NODE_NETWORK, NetworkAddress, VersionMessage
 from .peer import PeerHandshake, PeerProtocolError, PeerState
 from .connection import PeerConnection, PeerManager
 
@@ -24,6 +32,8 @@ __all__ = [
     "Message",
     "MessageParser",
     "NetworkAddress",
+    "NODE_COMPACT_FILTERS",
+    "NODE_NETWORK",
     "PeerHandshake",
     "PeerConnection",
     "PeerManager",
@@ -35,8 +45,14 @@ __all__ = [
     "TESTNET4_MAGIC",
     "VersionMessage",
     "decode_headers",
+    "decode_cfheaders",
+    "decode_filter_checkpoints",
+    "decode_filter_range",
     "decode_inventory",
     "encode_headers",
+    "encode_cfcheckpt",
+    "encode_cfheaders",
+    "encode_cfilter",
     "encode_inventory",
     "encode_message",
 ]

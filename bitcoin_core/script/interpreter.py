@@ -12,6 +12,7 @@ from enum import IntFlag
 from typing import Callable, Iterable
 
 from bitcoin_core.crypto.hashes import hash160, hash256, sha256
+from bitcoin_core.crypto.secp256k1 import is_strict_der_signature
 from bitcoin_core.primitives.transaction import Transaction
 from bitcoin_core.script import opcodes as op
 
@@ -56,6 +57,13 @@ class ScriptFlags(IntFlag):
     DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM = 1024
     STRICTENC = 2048
     LOW_S = 4096
+    TAPROOT = 8192
+    DERSIG = 16384
+    WITNESS = 32768
+    MINIMAL_IF = 65536
+    NULLFAIL = 131072
+    WITNESS_PUBKEYTYPE = 262144
+    CONST_SCRIPTCODE = 524288
 
 
 def cast_to_bool(value: bytes) -> bool:
@@ -150,6 +158,11 @@ def _pop_num(stack: list[bytes], flags: ScriptFlags, *, max_size: int = 4) -> in
     return decode_script_num(stack.pop(), max_size=max_size, minimal=bool(flags & ScriptFlags.MINIMAL_DATA))
 
 
+def _check_der_signature(signature: bytes, flags: ScriptFlags) -> None:
+    if signature and flags & ScriptFlags.DERSIG and not is_strict_der_signature(signature):
+        raise ScriptError("signature is not strict DER")
+
+
 def _minimal_push(opcode: int, data: bytes) -> bool:
     size = len(data)
     if size == 0:
@@ -167,6 +180,25 @@ def _minimal_push(opcode: int, data: bytes) -> bool:
     return opcode == op.OP_PUSHDATA4
 
 
+def _has_canonical_push(script: bytes, value: bytes) -> bool:
+    """Return whether script contains the canonical opcode push of value."""
+    offset = 0
+    try:
+        while offset < len(script):
+            opcode, pushed, offset = _read_op(script, offset)
+            if opcode == op.OP_0:
+                pushed = b""
+            elif opcode == op.OP_1NEGATE:
+                pushed = b"\x81"
+            elif op.OP_1 <= opcode <= op.OP_16:
+                pushed = bytes((opcode - op.OP_1 + 1,))
+            if pushed is not None and pushed == value and _minimal_push(opcode, pushed):
+                return True
+    except ScriptError:
+        return False
+    return False
+
+
 def eval_script(
     script: bytes,
     stack: Iterable[bytes] = (),
@@ -174,6 +206,7 @@ def eval_script(
     flags: ScriptFlags = ScriptFlags.NONE,
     checker: SignatureChecker | None = None,
     tapscript: bool = False,
+    witness_v0: bool = False,
     taproot_checker: TaprootChecker | None = None,
     sigop_budget: list[int] | None = None,
     tx_context: ScriptTransactionContext | None = None,
@@ -202,18 +235,25 @@ def eval_script(
         opcode, pushed, offset = _read_op(script, offset)
         instruction_position = opcode_position
         opcode_position += 1
-        if pushed is not None and len(pushed) > MAX_SCRIPT_ELEMENT_SIZE:
-            raise ScriptError("pushed element exceeds 520 bytes")
         if opcode > op.OP_16:
             op_count += 1
             if not tapscript and op_count > MAX_OPS_PER_SCRIPT:
                 raise ScriptError("operation count exceeds limit")
         if opcode in disabled and not tapscript:
             raise ScriptError("disabled opcode")
+        if (
+            opcode == op.OP_CODESEPARATOR
+            and flags & ScriptFlags.CONST_SCRIPTCODE
+            and not witness_v0
+            and not tapscript
+        ):
+            raise ScriptError("OP_CODESEPARATOR is discouraged by constant-script-code policy")
 
         executing = all(conditions)
         if pushed is not None:
             if executing:
+                if len(pushed) > MAX_SCRIPT_ELEMENT_SIZE:
+                    raise ScriptError("pushed element exceeds 520 bytes")
                 if flags & ScriptFlags.MINIMAL_DATA and not _minimal_push(opcode, pushed):
                     raise ScriptError("non-minimal data push")
                 main.append(pushed)
@@ -225,7 +265,7 @@ def eval_script(
             if executing:
                 _require(main, 1)
                 raw = main.pop()
-                if (flags & ScriptFlags.MINIMAL_DATA or tapscript) and raw not in (b"", b"\x01"):
+                if ((witness_v0 and flags & ScriptFlags.MINIMAL_IF) or tapscript) and raw not in (b"", b"\x01"):
                     raise ScriptError("non-minimal IF argument")
                 value = cast_to_bool(raw)
                 if opcode == op.OP_NOTIF:
@@ -442,7 +482,14 @@ def eval_script(
             _require(main, 2)
             pubkey = main.pop()
             signature = main.pop()
+            if not tapscript:
+                _check_der_signature(signature, flags)
             code = script[last_code_separator:]
+            if (
+                flags & ScriptFlags.CONST_SCRIPTCODE and not witness_v0 and not tapscript
+                and _has_canonical_push(code, signature)
+            ):
+                raise ScriptError("signature appears in a constant script-code region")
             if tapscript:
                 if opcode in (op.OP_CHECKMULTISIG, op.OP_CHECKMULTISIGVERIFY):
                     raise ScriptError("CHECKMULTISIG is disabled in tapscript")
@@ -467,6 +514,8 @@ def eval_script(
                         success = True
             else:
                 success = bool(checker and checker(signature, pubkey, code)) if signature else False
+            if not success and signature and flags & ScriptFlags.NULLFAIL:
+                raise ScriptError("non-null signature failed CHECKSIG")
             if opcode == op.OP_CHECKSIGVERIFY:
                 if not success:
                     raise ScriptError("CHECKSIGVERIFY failed")
@@ -512,12 +561,19 @@ def eval_script(
                 raise ScriptError("invalid multisig signature count")
             _require(main, sig_count + 1)
             signatures = [main.pop() for _ in range(sig_count)][::-1]
+            for signature in signatures:
+                _check_der_signature(signature, flags)
             dummy = main.pop()
             if flags & ScriptFlags.NULL_DUMMY and dummy:
                 raise ScriptError("multisig dummy argument is not null")
             matched = True
             key_index = sig_index = 0
             code = script[last_code_separator:]
+            if (
+                flags & ScriptFlags.CONST_SCRIPTCODE
+                and any(_has_canonical_push(code, signature) for signature in signatures)
+            ):
+                raise ScriptError("signature appears in a constant script-code region")
             while matched and sig_index < sig_count:
                 if checker is None or not checker(signatures[sig_index], pubkeys[key_index], code):
                     key_index += 1
@@ -527,6 +583,8 @@ def eval_script(
                     sig_index += 1
                     key_index += 1
             matched = matched and sig_index == sig_count
+            if not matched and any(signatures) and flags & ScriptFlags.NULLFAIL:
+                raise ScriptError("non-null signature failed CHECKMULTISIG")
             if opcode == op.OP_CHECKMULTISIGVERIFY:
                 if not matched:
                     raise ScriptError("CHECKMULTISIGVERIFY failed")

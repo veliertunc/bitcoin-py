@@ -5,12 +5,22 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from bitcoin_core.consensus.chainstate import BlockConnectionError, CoinsView, InputVerifier
+from bitcoin_core.consensus.chainstate import (
+    BlockConnectionError,
+    CoinsView,
+    InputVerifier,
+    connect_block as validate_and_connect_block,
+)
 from bitcoin_core.consensus.params import ConsensusParams
 from bitcoin_core.network.connection import PeerConnection
 from bitcoin_core.network.messages import InventoryVector, decode_inventory, encode_inventory
 from bitcoin_core.network.protocol import Message
-from bitcoin_core.node.chain import BlockIndex, HeaderChain
+from bitcoin_core.node.chain import (
+    MAX_FUTURE_BLOCK_TIME,
+    BlockIndex,
+    HeaderChain,
+    expected_work_bits,
+)
 from bitcoin_core.node.storage import SQLiteNodeStore
 from bitcoin_core.primitives.block import Block
 
@@ -31,6 +41,76 @@ class BlockSynchronizer:
     check_pow: bool = True
     in_flight: dict[bytes, PeerConnection] = field(default_factory=dict)
     pending: dict[bytes, tuple[Block, PeerConnection]] = field(default_factory=dict)
+    last_rejection: str | None = None
+
+    def test_block(self, block: Block) -> str | None:
+        """Check a proposal against the active tip without mutating chainstate."""
+        block_hash = block.header.block_hash
+        if self.store.is_active_block(block_hash):
+            return "duplicate"
+        if self.store.has_block(block_hash):
+            return "duplicate-inconclusive"
+        previous_hash = self.store.best_block()
+        if block.header.previous_block != previous_hash:
+            return "inconclusive-not-best-prevblk"
+        previous = self.headers.indexes.get(previous_hash) if previous_hash is not None else None
+        if previous is None:
+            return "inconclusive-not-best-prevblk"
+
+        height = previous.height + 1
+        if block.header.timestamp <= previous.median_time_past:
+            return "time-too-old"
+        if block.header.timestamp > int(time.time()) + MAX_FUTURE_BLOCK_TIME:
+            return "time-too-new"
+        try:
+            if block.header.bits != expected_work_bits(previous, block.header.timestamp, self.params):
+                return "bad-diffbits"
+        except ValueError:
+            return "bad-diffbits"
+        for activation_height, minimum_version, deployment in (
+            (self.params.bip34_height, 2, "version"),
+            (self.params.bip66_height, 3, "version"),
+            (self.params.bip65_height, 4, "version"),
+        ):
+            if activation_height is not None and height >= activation_height and block.header.version < minimum_version:
+                return f"bad-{deployment}"
+
+        staged = CoinsView(self.coins.coins.copy())
+        try:
+            validate_and_connect_block(
+                staged,
+                block,
+                height,
+                self.params,
+                input_verifier=self.input_verifier,
+                check_pow=False,
+                median_time_past=previous.median_time_past,
+            )
+        except (ValueError, BlockConnectionError) as exc:
+            return str(exc) or "rejected"
+        return None
+
+    async def accept_local_block(self, block: Block) -> str | None:
+        """Validate and connect a locally submitted block, returning a BIP22 status."""
+        block_hash = block.header.block_hash
+        if self.store.has_block(block_hash):
+            return "duplicate"
+        try:
+            index = self.headers.add_header(block.header)
+        except ValueError as exc:
+            return f"rejected: {exc}"
+        self.store.save_header(index)
+        self.store.save_block(block, index)
+        previous_tip = self.store.best_block()
+        self.last_rejection = None
+        await self._activate_if_ready()
+        if self.store.best_block() == block_hash:
+            return None
+        if self.last_rejection is not None:
+            return f"rejected: {self.last_rejection}"
+        if previous_tip == block_hash:
+            return "duplicate"
+        return "inconclusive"
 
     async def request_more(self, peers: list[PeerConnection] | tuple[PeerConnection, ...]) -> int:
         """Fill the bounded block-download window using established peers."""
@@ -185,7 +265,8 @@ class BlockSynchronizer:
                 input_verifier=self.input_verifier,
                 check_pow=self.check_pow,
             )
-        except (ValueError, BlockConnectionError):
+        except (ValueError, BlockConnectionError) as exc:
+            self.last_rejection = str(exc)
             self.store.discard_side_blocks(tuple(index.block_hash for index in new_branch))
             for index in new_branch:
                 pending = self.pending.pop(index.block_hash, None)
