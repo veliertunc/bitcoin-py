@@ -11,6 +11,7 @@ from .rpc import NodeRPC, RPCError, RPCServer
 from .utxo_stats import calculate_utxo_stats, serialize_utxo_entry
 from .mining import create_block_template
 from .mempool_persistence import MempoolLoadResult, dump_mempool, load_mempool
+from .orphanage import OrphanTransaction, Orphanage
 
 __all__ = [
     "BlockIndex",
@@ -35,4 +36,6 @@ __all__ = [
     "MempoolLoadResult",
     "dump_mempool",
     "load_mempool",
+    "OrphanTransaction",
+    "Orphanage",
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from bitcoin_core.consensus.chainstate import (
@@ -39,6 +40,7 @@ class BlockSynchronizer:
     params: ConsensusParams
     input_verifier: InputVerifier
     check_pow: bool = True
+    activation_handler: Callable[[tuple[Block, ...], tuple[Block, ...]], Awaitable[None]] | None = None
     in_flight: dict[bytes, PeerConnection] = field(default_factory=dict)
     pending: dict[bytes, tuple[Block, PeerConnection]] = field(default_factory=dict)
     last_rejection: str | None = None
@@ -246,6 +248,11 @@ class BlockSynchronizer:
         if branch is None:
             return False
         _fork, old_branch, new_branch = branch
+        disconnected = tuple(
+            block
+            for index in reversed(old_branch)
+            if (block := self.store.load_block(index.block_hash)) is not None
+        )
         blocks = []
         for index in new_branch:
             pending = self.pending.get(index.block_hash)
@@ -276,6 +283,8 @@ class BlockSynchronizer:
             return False
         for index in new_branch:
             self.pending.pop(index.block_hash, None)
+        if self.activation_handler is not None:
+            await self.activation_handler(disconnected, tuple(blocks))
         return True
 
     def peer_disconnected(self, peer: PeerConnection) -> tuple[bytes, ...]:

@@ -49,6 +49,11 @@ class HeaderSynchronizer:
         """Request headers from one established peer."""
         await peer.send("getheaders", GetHeaders(self.protocol_version, block_locator(self.chain)).serialize())
 
+    async def begin_until(self, peer: PeerConnection, stop_hash: bytes) -> None:
+        """Request the header chain ending at a block announced by a peer."""
+        request = GetHeaders(self.protocol_version, block_locator(self.chain), stop_hash)
+        await peer.send("getheaders", request.serialize())
+
     def serve_getheaders(self, payload: bytes) -> bytes:
         """Build an encoded headers response for a peer's locator request."""
         request = GetHeaders.deserialize(payload)

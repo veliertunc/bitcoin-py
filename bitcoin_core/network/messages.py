@@ -137,6 +137,23 @@ class GetHeaders:
         return cls(version, locators, stop_hash)
 
 
+@dataclass(frozen=True, slots=True)
+class GetBlocks:
+    """Legacy block-inventory request using a locator and optional stop hash."""
+
+    protocol_version: int
+    locators: tuple[bytes, ...]
+    stop_hash: bytes = bytes(32)
+
+    def serialize(self) -> bytes:
+        return GetHeaders(self.protocol_version, self.locators, self.stop_hash).serialize()
+
+    @classmethod
+    def deserialize(cls, payload: bytes) -> GetBlocks:
+        request = GetHeaders.deserialize(payload)
+        return cls(request.protocol_version, request.locators, request.stop_hash)
+
+
 def encode_headers(headers: tuple[BlockHeader, ...] | list[BlockHeader]) -> bytes:
     """Serialize a headers message, including the required zero tx-count per header."""
     if len(headers) > MAX_HEADERS:

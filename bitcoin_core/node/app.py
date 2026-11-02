@@ -14,13 +14,13 @@ from pathlib import Path
 
 from bitcoin_core.consensus.chainstate import CoinsView
 from bitcoin_core.network.addrman import AddressBook
-from bitcoin_core.network.connection import PeerManager
+from bitcoin_core.network.connection import PeerConnection, PeerManager
 from bitcoin_core.network.messages import InventoryVector, encode_inventory
 from bitcoin_core.network.version import NODE_COMPACT_FILTERS, NODE_NETWORK, NetworkAddress, VersionMessage
 from bitcoin_core.node.block_sync import BlockSynchronizer
 from bitcoin_core.node.chain import HeaderChain
 from bitcoin_core.node.chainparams import ChainParams, get_chain_params
-from bitcoin_core.node.mempool import Mempool
+from bitcoin_core.node.mempool import Mempool, MempoolError
 from bitcoin_core.node.mempool_persistence import (
     MempoolLoadResult,
     dump_mempool,
@@ -55,6 +55,7 @@ class BitcoinNode:
     relay: MempoolRelay = field(init=False)
     header_sync: HeaderSynchronizer = field(init=False)
     block_sync: BlockSynchronizer = field(init=False)
+    protocol: NodeProtocol = field(init=False)
     rpc_server: RPCServer = field(init=False)
     input_verifier: ConsensusScriptVerifier = field(init=False)
     address_book: AddressBook = field(init=False)
@@ -116,8 +117,9 @@ class BitcoinNode:
             self.coins,
             self.params.consensus,
             self.input_verifier,
+            activation_handler=self._handle_chain_activation,
         )
-        protocol = NodeProtocol(
+        self.protocol = NodeProtocol(
             self.header_sync,
             self.block_sync,
             self._peers,
@@ -127,8 +129,8 @@ class BitcoinNode:
         self._manager = PeerManager(
             version_factory=self._version_for,
             magic=self.params.message_start,
-            message_handler=protocol,
-            disconnect_handler=self.block_sync.peer_disconnected,
+            message_handler=self.protocol,
+            disconnect_handler=self._peer_disconnected,
         )
         rpc = NodeRPC(
             self.store,
@@ -174,7 +176,6 @@ class BitcoinNode:
         """Submit a mined block through the same chain activation path as P2P blocks."""
         status = await self.block_sync.accept_local_block(block)
         if status is None:
-            self.relay.mempool.remove_for_block(block.transactions)
             announcement = encode_inventory(
                 [InventoryVector(2, block.header.block_hash)]
             )
@@ -185,6 +186,38 @@ class BitcoinNode:
                     except (ConnectionError, OSError):
                         continue
         return status
+
+    async def _handle_chain_activation(
+        self,
+        disconnected: tuple[Block, ...],
+        connected: tuple[Block, ...],
+    ) -> None:
+        """Reconcile pending transactions after an active-chain switch."""
+        connected_transactions = tuple(
+            transaction
+            for block in connected
+            for transaction in block.transactions
+        )
+        self.mempool.remove_for_block(connected_transactions)
+        self.mempool.revalidate(
+            self.coins,
+            self.store.best_height() + 1,
+            input_verifier=self.input_verifier,
+            median_time_past=self.headers.tip.median_time_past if self.headers.tip else 0,
+        )
+        # Disconnected blocks are supplied oldest first, so parents are offered
+        # before their children when restoring transactions to the pool.
+        for block in disconnected:
+            for transaction in block.transactions[1:]:
+                try:
+                    await self.relay.submit(transaction, self._peers())
+                except MempoolError:
+                    continue
+
+    def _peer_disconnected(self, peer: PeerConnection) -> None:
+        """Release all per-peer synchronization state when a socket closes."""
+        self.block_sync.peer_disconnected(peer)
+        self.protocol.pending_header_requests.pop(peer, None)
 
     def _dump_mempool(self) -> str:
         """Persist the current transaction pool and return its file path."""

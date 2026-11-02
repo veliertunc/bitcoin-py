@@ -11,7 +11,7 @@ from .protocol import (
     MessageParser,
     encode_message,
 )
-from .messages import GetHeaders, InventoryVector, decode_headers, decode_inventory, encode_headers, encode_inventory
+from .messages import GetBlocks, GetHeaders, InventoryVector, decode_headers, decode_inventory, encode_headers, encode_inventory
 from .compact_filters import (
     decode_cfheaders,
     decode_filter_checkpoints,
@@ -26,6 +26,7 @@ from .connection import PeerConnection, PeerManager
 
 __all__ = [
     "GetHeaders",
+    "GetBlocks",
     "InventoryVector",
     "InvalidMessage",
     "MAINNET_MAGIC",

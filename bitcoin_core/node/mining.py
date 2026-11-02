@@ -145,7 +145,7 @@ def create_block_template(
         "transactions": transactions,
         "coinbaseaux": {"flags": ""},
         "coinbasevalue": block_subsidy(height, params) + fees,
-        "longpollid": previous.block_hash[::-1].hex() + str(mempool.sequence),
+        "longpollid": previous.block_hash[::-1].hex() + str(mempool.transactions_updated),
         "target": f"{target:064x}",
         "mintime": previous.median_time_past + 1,
         "mutable": ["time", "transactions", "prevblock"],

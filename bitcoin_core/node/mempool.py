@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import time
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -65,6 +66,7 @@ class Mempool:
     fee_deltas: dict[bytes, int] = field(default_factory=dict)
     total_vbytes: int = 0
     sequence: int = 1
+    transactions_updated: int = 1
 
     def __post_init__(self) -> None:
         if self.max_vbytes < 0 or self.min_relay_fee_per_kvb < 0:
@@ -240,6 +242,7 @@ class Mempool:
         )
         self.entries[txid] = entry
         self.sequence += 1
+        self.transactions_updated += 1
         self.total_vbytes += vsize
         for parent_id in parents:
             self.entries[parent_id].children.add(txid)
@@ -269,6 +272,7 @@ class Mempool:
             if entry is None:
                 continue
             self.sequence += 1
+            self.transactions_updated += 1
             self.unbroadcast_txs.discard(current)
             self.total_vbytes -= entry.vsize
             removed.append(current)
@@ -313,6 +317,8 @@ class Mempool:
             self.fee_deltas[txid] = updated
         else:
             self.fee_deltas.pop(txid, None)
+        if updated != current:
+            self.transactions_updated += 1
         entry = self.entries.get(txid)
         if entry is not None:
             entry.fee_delta = updated
@@ -320,19 +326,83 @@ class Mempool:
 
     def clear_prioritisation(self, txid: bytes) -> None:
         """Clear a transaction's fee delta when it confirms or conflicts."""
-        self.fee_deltas.pop(txid, None)
+        previous_delta = self.fee_deltas.pop(txid, 0)
         entry = self.entries.get(txid)
         if entry is not None:
+            previous_delta = entry.fee_delta or previous_delta
             entry.fee_delta = 0
+        if previous_delta:
+            self.transactions_updated += 1
 
     def clear(self) -> None:
         """Remove all mempool entries and dependency indexes."""
         self.sequence += len(self.entries)
+        self.transactions_updated += len(self.entries)
         self.entries.clear()
         self.spent_outpoints.clear()
         self.unbroadcast_txs.clear()
         self.fee_deltas.clear()
         self.total_vbytes = 0
+
+    def revalidate(
+        self,
+        chain_coins: CoinsView,
+        height: int,
+        *,
+        input_verifier: InputVerifier,
+        median_time_past: int | None = None,
+    ) -> tuple[bytes, ...]:
+        """Rebuild the pool in dependency order against a changed active chain."""
+        previous = self.entries.copy()
+        candidates = {txid: entry.transaction for txid, entry in previous.items()}
+        priorities = self.fee_deltas.copy()
+        unbroadcast = self.unbroadcast_txs.copy()
+
+        children: dict[bytes, set[bytes]] = {txid: set() for txid in candidates}
+        indegree = {txid: 0 for txid in candidates}
+        for txid, tx in candidates.items():
+            parents = {
+                txin.previous_output.txid
+                for txin in tx.inputs
+                if txin.previous_output.txid in candidates and txin.previous_output.txid != txid
+            }
+            indegree[txid] = len(parents)
+            for parent in parents:
+                children[parent].add(txid)
+
+        self.entries.clear()
+        self.spent_outpoints.clear()
+        self.total_vbytes = 0
+        self.fee_deltas = priorities
+        self.unbroadcast_txs = unbroadcast
+        ready = [
+            (previous[txid].added_at, txid)
+            for txid, degree in indegree.items()
+            if degree == 0
+        ]
+        heapq.heapify(ready)
+        while ready:
+            _added_at, txid = heapq.heappop(ready)
+            try:
+                self.accept(
+                    candidates[txid],
+                    chain_coins,
+                    height,
+                    input_verifier=input_verifier,
+                    median_time_past=median_time_past,
+                    now=previous[txid].added_at,
+                )
+            except MempoolError:
+                pass
+            for child in children[txid]:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    heapq.heappush(ready, (previous[child].added_at, child))
+        # A cyclic dependency is invalid; any descendants of a rejected parent
+        # have already been reconsidered and rejected for their missing input.
+        removed = tuple(txid for txid in candidates if txid not in self.entries)
+        self.unbroadcast_txs.intersection_update(self.entries)
+        return removed
 
     def _trim_to_size(self) -> None:
         while self.total_vbytes > self.max_vbytes and self.entries:

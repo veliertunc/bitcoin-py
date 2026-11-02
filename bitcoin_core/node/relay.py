@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from bitcoin_core.consensus.chainstate import CoinsView, InputVerifier
 from bitcoin_core.network.connection import PeerConnection
@@ -11,6 +11,7 @@ from bitcoin_core.network.messages import InventoryVector, decode_inventory, enc
 from bitcoin_core.network.protocol import Message
 from bitcoin_core.node.mempool import MSG_TX, MSG_WTX, Mempool, MempoolError
 from bitcoin_core.node.mempool import MempoolEntry
+from bitcoin_core.node.orphanage import Orphanage
 from bitcoin_core.primitives.transaction import Transaction
 
 
@@ -23,6 +24,7 @@ class MempoolRelay:
     height: Callable[[], int]
     median_time_past: Callable[[], int]
     input_verifier: InputVerifier
+    orphanage: Orphanage = field(default_factory=Orphanage)
 
     async def submit(
         self,
@@ -41,14 +43,74 @@ class MempoolRelay:
         )
         if unbroadcast:
             self.mempool.unbroadcast_txs.add(entry.txid)
+        await self._announce(entry, peers)
+        await self._process_orphans(entry.txid, peers)
+        return entry
+
+    async def _announce(
+        self,
+        entry: MempoolEntry,
+        peers: list[PeerConnection],
+        *,
+        exclude: PeerConnection | None = None,
+    ) -> None:
         inventory = encode_inventory([InventoryVector(MSG_TX, entry.txid)])
         for candidate in peers:
-            if candidate.established and entry.fee * 1_000 >= candidate.fee_filter * entry.vsize:
+            if (
+                candidate is not exclude
+                and candidate.established
+                and entry.fee * 1_000 >= candidate.fee_filter * entry.vsize
+            ):
                 try:
                     await candidate.send("inv", inventory)
                 except (ConnectionError, OSError):
                     continue
-        return entry
+
+    def _missing_parents(self, transaction: Transaction) -> set[bytes]:
+        coins = self.coins().coins
+        missing = set()
+        for txin in transaction.inputs:
+            outpoint = txin.previous_output
+            if (outpoint.txid, outpoint.index) in coins or outpoint.txid in self.mempool.entries:
+                continue
+            missing.add(outpoint.txid)
+        return missing
+
+    async def _request_missing_parents(self, peer: PeerConnection, missing: set[bytes]) -> None:
+        if not peer.established or not missing:
+            return
+        request = encode_inventory([InventoryVector(MSG_TX, txid) for txid in sorted(missing)])
+        try:
+            await peer.send("getdata", request)
+        except (ConnectionError, OSError):
+            return
+
+    async def _process_orphans(self, parent_txid: bytes, peers: list[PeerConnection]) -> None:
+        pending = list(self.orphanage.children_of(parent_txid))
+        while pending:
+            orphan_txid = pending.pop(0)
+            orphan = self.orphanage.remove(orphan_txid)
+            if orphan is None:
+                continue
+            missing = self._missing_parents(orphan.transaction)
+            if missing:
+                self.orphanage.add(orphan.transaction, missing, orphan.peer)
+                if orphan.peer is not None:
+                    await self._request_missing_parents(orphan.peer, missing)
+                continue
+            try:
+                entry = self.mempool.accept(
+                    orphan.transaction,
+                    self.coins(),
+                    self.height(),
+                    input_verifier=self.input_verifier,
+                    median_time_past=self.median_time_past(),
+                )
+            except MempoolError:
+                # A now-known parent may have made this transaction invalid or conflicting.
+                continue
+            await self._announce(entry, peers, exclude=orphan.peer)
+            pending.extend(self.orphanage.children_of(entry.txid))
 
     async def handle(self, peer: PeerConnection, message: Message, peers: list[PeerConnection]) -> bool:
         """Process tx or inv messages; return whether the message was handled."""
@@ -61,6 +123,9 @@ class MempoolRelay:
             try:
                 await self.submit(tx, [candidate for candidate in peers if candidate is not peer])
             except MempoolError:
+                missing = self._missing_parents(tx)
+                if missing and self.orphanage.add(tx, missing, peer):
+                    await self._request_missing_parents(peer, missing)
                 return True
             return True
         if message.command == "inv":

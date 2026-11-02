@@ -136,6 +136,9 @@ class NodeRPC:
             requested_rules = request.get("rules", [])
             if not isinstance(requested_rules, list) or any(not isinstance(rule, str) for rule in requested_rules):
                 raise RPCError(-8, "rules must be an array of strings")
+            longpollid = request.get("longpollid")
+            if longpollid is not None:
+                await self._wait_for_template_change(longpollid)
             try:
                 return create_block_template(
                     self.headers,
@@ -309,6 +312,30 @@ class NodeRPC:
             return [self._peer_info(peer, peer_id) for peer_id, peer in enumerate(self.peers())]
         raise RPCError(-32601, f"Method not found: {method}")
 
+    async def _wait_for_template_change(self, longpollid: Any) -> None:
+        """Wait until the active tip or transaction pool changes from a GBT ID."""
+        if not isinstance(longpollid, str) or len(longpollid) <= 64:
+            raise RPCError(-8, "longpollid must contain a block hash and mempool sequence")
+        try:
+            block_hash = bytes.fromhex(longpollid[:64])
+        except ValueError as exc:
+            raise RPCError(-8, "longpollid contains an invalid block hash") from exc
+        sequence_text = longpollid[64:]
+        if (
+            len(block_hash) != 32
+            or len(sequence_text) > 20
+            or not sequence_text.isascii()
+            or not sequence_text.isdecimal()
+        ):
+            raise RPCError(-8, "longpollid contains an invalid mempool sequence")
+        sequence = int(sequence_text)
+
+        while True:
+            current_tip = self.store.best_block()
+            if current_tip != block_hash[::-1] or self.mempool.transactions_updated != sequence:
+                return
+            await asyncio.sleep(0.5)
+
     @staticmethod
     def _param(params: list[Any] | dict[str, Any], index: int, name: str, default: Any = None) -> Any:
         if isinstance(params, dict):
@@ -441,8 +468,8 @@ class NodeRPC:
         block = self.store.load_block(block_hash)
         if block is None:
             raise RPCError(-5, "Block not found")
-        if not isinstance(verbosity, (bool, int)) or verbosity not in (0, 1, 2, False, True):
-            raise RPCError(-8, "Block verbosity must be 0, 1, or 2")
+        if not isinstance(verbosity, (bool, int)) or verbosity not in (0, 1, 2, 3, False, True):
+            raise RPCError(-8, "Block verbosity must be 0, 1, 2, or 3")
         if verbosity is False or verbosity == 0:
             return block.serialize().hex()
         index = self.headers.indexes.get(block_hash)
@@ -471,7 +498,55 @@ class NodeRPC:
             result["previousblockhash"] = block.header.previous_block[::-1].hex()
         if verbosity == 2:
             result["tx"] = [self._transaction_json(tx) for tx in block.transactions]
+        elif verbosity == 3:
+            result["tx"] = self._block_transactions_with_prevouts(block_hash, block)
         return result
+
+    def _block_transactions_with_prevouts(self, block_hash: bytes, block: Block) -> list[dict[str, Any]]:
+        """Build verbosity-3 transaction objects using block undo and intra-block outputs."""
+        undo = self.store.load_undo(block_hash)
+        if undo is None:
+            raise RPCError(-8, "Undo data is unavailable for this block")
+        spent = dict(undo.spent)
+        outputs: dict[tuple[bytes, int], tuple[int, bytes, bool, int]] = {}
+        transactions = []
+        for tx_index, transaction in enumerate(block.transactions):
+            tx_json = self._transaction_json(transaction)
+            if tx_index:
+                inputs = []
+                for txin, input_json in zip(transaction.inputs, tx_json["vin"]):
+                    outpoint = txin.previous_output
+                    coin = spent.get((outpoint.txid, outpoint.index))
+                    if coin is not None:
+                        value = (coin.value, coin.script_pubkey, coin.coinbase, coin.height)
+                    else:
+                        value = outputs.get((outpoint.txid, outpoint.index))
+                    if value is None:
+                        raise RPCError(-32603, "Undo data does not contain a transaction prevout")
+                    amount, script, generated, height = value
+                    inputs.append({
+                        **input_json,
+                        "prevout": {
+                            "generated": generated,
+                            "height": height,
+                            "value": amount / 100_000_000,
+                            "scriptPubKey": {
+                                "asm": "",
+                                "hex": script.hex(),
+                                "type": "nonstandard",
+                            },
+                        },
+                    })
+                tx_json["vin"] = inputs
+            transactions.append(tx_json)
+            for output_index, txout in enumerate(transaction.outputs):
+                outputs[(transaction.txid, output_index)] = (
+                    txout.value,
+                    txout.script_pubkey,
+                    tx_index == 0,
+                    undo.height,
+                )
+        return transactions
 
     def _get_block_filter(self, block_hash_value: Any, filter_type: Any) -> dict[str, str]:
         if filter_type != "basic":
@@ -507,14 +582,28 @@ class NodeRPC:
         best = self.store.best_block()
         tip = self.headers.indexes.get(best) if best is not None else None
         header_tip = self.headers.tip
+        height = self.store.best_height()
+        buried_forks = {
+            "bip16": self.params.p2sh_height,
+            "bip34": self.params.bip34_height,
+            "bip66": self.params.bip66_height,
+            "bip65": self.params.bip65_height,
+            "csv": self.params.csv_height,
+            "segwit": self.params.segwit_height,
+        }
         return {
             "chain": self.network_name,
-            "blocks": self.store.best_height(),
+            "blocks": height,
             "headers": header_tip.height if header_tip else -1,
             "bestblockhash": best[::-1].hex() if best else "0" * 64,
             "difficulty": self._active_difficulty(),
             "chainwork": f"{tip.chainwork:064x}" if tip else "0" * 64,
             "pruned": False,
+            "softforks": {
+                name: {"type": "buried", "active": height >= activation, "height": activation}
+                for name, activation in buried_forks.items()
+                if activation is not None
+            },
         }
 
     def _active_difficulty(self) -> float:

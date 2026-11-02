@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from bitcoin_core.network.addrman import AddressBook
 from bitcoin_core.network.connection import PeerConnection
@@ -21,6 +21,7 @@ from bitcoin_core.network.compact_filters import (
 )
 from bitcoin_core.crypto.hashes import hash256
 from bitcoin_core.network.messages import (
+    GetBlocks,
     TimestampedAddress,
     decode_addr,
     decode_inventory,
@@ -28,6 +29,7 @@ from bitcoin_core.network.messages import (
     encode_headers,
     encode_inventory,
     InventoryVector,
+    MAX_HEADERS,
 )
 from bitcoin_core.network.protocol import Message
 from bitcoin_core.network.version import NetworkAddress
@@ -35,6 +37,9 @@ from bitcoin_core.node.block_sync import BlockSynchronizer
 from bitcoin_core.node.mempool import MempoolError
 from bitcoin_core.node.relay import MempoolRelay
 from bitcoin_core.node.sync import HeaderSynchronizer
+
+MAX_GETBLOCKS_RESULTS = 500
+MSG_BLOCK = 2
 
 
 @dataclass(slots=True)
@@ -46,6 +51,7 @@ class NodeProtocol:
     peers: Callable[[], list[PeerConnection]]
     relay: MempoolRelay | None = None
     address_book: AddressBook | None = None
+    pending_header_requests: dict[PeerConnection, bytes] = field(default_factory=dict)
 
     async def __call__(self, peer: PeerConnection, message: Message) -> None:
         if message.command == "verack":
@@ -104,9 +110,42 @@ class NodeProtocol:
             await peer.send("addr", encode_addr(entries))
         elif message.command == "getheaders":
             await peer.send("headers", self.headers.serve_getheaders(message.payload))
+        elif message.command == "getblocks":
+            try:
+                request = GetBlocks.deserialize(message.payload)
+            except ValueError:
+                await peer.close()
+                raise
+            store = self.blocks.store
+            fork_height = 0
+            for block_hash in request.locators:
+                candidate = self.headers.chain.indexes.get(block_hash)
+                if (
+                    candidate is not None
+                    and store.active_block_hash(candidate.height) == block_hash
+                ):
+                    fork_height = candidate.height
+                    break
+            inventory = []
+            best_height = store.best_height()
+            for height in range(fork_height + 1, min(best_height + 1, fork_height + 1 + MAX_GETBLOCKS_RESULTS)):
+                block_hash = store.active_block_hash(height)
+                if block_hash is None:
+                    break
+                inventory.append(InventoryVector(MSG_BLOCK, block_hash))
+                if block_hash == request.stop_hash:
+                    break
+            if inventory:
+                await peer.send("inv", encode_inventory(inventory))
         elif message.command == "headers":
             old_tip = self.blocks.store.best_block()
-            await self.headers.handle(peer, message)
+            try:
+                count = await self.headers.handle(peer, message)
+            except ValueError:
+                self.pending_header_requests.pop(peer, None)
+                raise
+            if count < MAX_HEADERS:
+                self.pending_header_requests.pop(peer, None)
             await self.blocks.request_more(self.peers())
             await self._reconcile_tip(old_tip, peer)
         elif message.command == "block":
@@ -125,7 +164,32 @@ class NodeProtocol:
             missing = await self.blocks.serve_inventory(peer, missing)
             if missing:
                 await peer.send("notfound", encode_inventory(missing))
-        elif message.command in ("inv", "tx") and self.relay is not None:
+        elif message.command == "inv":
+            try:
+                inventory = decode_inventory(message.payload)
+            except ValueError:
+                await peer.close()
+                raise
+            block_announcements = [
+                item for item in inventory if item.type & 0x3FFFFFFF == 2
+            ]
+            unknown_headers = [
+                item.hash
+                for item in block_announcements
+                if item.hash not in self.headers.chain.indexes
+            ]
+            if unknown_headers and peer not in self.pending_header_requests:
+                stop_hash = unknown_headers[-1]
+                self.pending_header_requests[peer] = stop_hash
+                try:
+                    await self.headers.begin_until(peer, stop_hash)
+                except (ConnectionError, OSError):
+                    self.pending_header_requests.pop(peer, None)
+            if block_announcements:
+                await self.blocks.request_more(self.peers())
+            if self.relay is not None:
+                await self.relay.handle(peer, message, self.peers())
+        elif message.command == "tx" and self.relay is not None:
             await self.relay.handle(peer, message, self.peers())
         elif message.command == "notfound":
             self.blocks.handle_notfound(peer, message.payload)
@@ -200,41 +264,40 @@ class NodeProtocol:
         new_hash = self.blocks.store.best_block()
         if new_hash is None or new_hash == old_hash:
             return
-        chain = self.headers.chain
-        old_index = chain.indexes.get(old_hash) if old_hash is not None else None
-        new_index = chain.indexes.get(new_hash)
+        new_index = self.headers.chain.indexes.get(new_hash)
         if new_index is None:
             return
-        left, right = old_index, new_index
-        while left is not None and right is not None and left.height > right.height:
-            left = left.previous
-        while left is not None and right is not None and right.height > left.height:
-            right = right.previous
-        while left is not right:
-            left = left.previous if left is not None else None
-            right = right.previous if right is not None else None
-        fork = left
-
-        disconnected = []
-        cursor = old_index
-        while cursor is not fork and cursor is not None:
-            block = self.blocks.store.load_block(cursor.block_hash)
-            if block is not None:
-                disconnected.append(block)
-            cursor = cursor.previous
-        disconnected.reverse()
-
-        included_txids: set[bytes] = set()
-        for height in range((fork.height + 1) if fork is not None else 0, new_index.height + 1):
-            block_hash = self.blocks.store.active_block_hash(height)
-            block = self.blocks.store.load_block(block_hash) if block_hash is not None else None
-            if block is None:
-                continue
-            included_txids.update(tx.txid for tx in block.transactions)
-            if self.relay is not None:
+        # The node's activation callback reconciles the pool for both local and
+        # peer-supplied blocks. Keep this fallback for protocol users that wire
+        # a synchronizer without an activation callback.
+        if self.relay is not None and self.blocks.activation_handler is None:
+            chain = self.headers.chain
+            old_index = chain.indexes.get(old_hash) if old_hash is not None else None
+            left, right = old_index, new_index
+            while left is not None and right is not None and left.height > right.height:
+                left = left.previous
+            while left is not None and right is not None and right.height > left.height:
+                right = right.previous
+            while left is not right:
+                left = left.previous if left is not None else None
+                right = right.previous if right is not None else None
+            fork = left
+            disconnected = []
+            cursor = old_index
+            while cursor is not fork and cursor is not None:
+                block = self.blocks.store.load_block(cursor.block_hash)
+                if block is not None:
+                    disconnected.append(block)
+                cursor = cursor.previous
+            disconnected.reverse()
+            included_txids: set[bytes] = set()
+            for height in range((fork.height + 1) if fork is not None else 0, new_index.height + 1):
+                block_hash = self.blocks.store.active_block_hash(height)
+                block = self.blocks.store.load_block(block_hash) if block_hash is not None else None
+                if block is None:
+                    continue
+                included_txids.update(tx.txid for tx in block.transactions)
                 self.relay.mempool.remove_for_block(block.transactions)
-
-        if self.relay is not None:
             for block in disconnected:
                 for transaction in block.transactions[1:]:
                     if transaction.txid in included_txids:
